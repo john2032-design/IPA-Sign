@@ -17,8 +17,8 @@ services:
         value: production
       - key: DATA_DIR
         value: /data
-      - key: RORKSIGN_BIN
-        value: /usr/local/bin/rorksign
+      - key: ZSIGN_BIN
+        value: /usr/local/bin/zsign
       - key: MAX_IPA_BYTES
         value: "4294967296"
       - key: MAX_CONCURRENT_JOBS
@@ -34,11 +34,11 @@ services:
       - key: PUBLIC_ORIGIN
         value: https://xsigner.onrender.com
       - key: B2_ENDPOINT
-        value: https://s3.us-east-005.backblazeb2.com
+        value: https://s3.ca-east-006.backblazeb2.com
       - key: B2_REGION
-        value: us-east-005
+        value: ca-east-006
       - key: B2_BUCKET
-        value: ipa-xsigner
+        value: xsigner
       - key: B2_KEY_ID
         sync: false
       - key: B2_APPLICATION_KEY
