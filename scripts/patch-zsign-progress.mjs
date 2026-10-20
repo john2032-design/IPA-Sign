@@ -80,12 +80,12 @@ replaceExactlyOnce(
   'the bundle signing completion point'
 );
 
-replaceRegexExactlyOnce(
-  /^([\t ]*ZLog::PrintV\("\>\>\> ReadCache:[^\n]*\n)([\t ]*if \(SignNode\(jvRoot\)\) \{)/gm,
-  '$1\tgXsignProgressTotal = CountZsignProgressOps(jvRoot);\n' +
+replaceExactlyOnce(
+  'if (SignNode(jvRoot)) {',
+  '\tgXsignProgressTotal = CountZsignProgressOps(jvRoot);\n' +
   '\tgXsignProgressDone = 0;\n' +
   '\tZLog::PrintV(">>> Progress: 0/%llu\\n", gXsignProgressTotal);\n' +
-  '$2',
+  '\tif (SignNode(jvRoot)) {',
   'the signing start point'
 );
 
