@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#090a0d">
+  <title>xsigner — IPA Signer</title>
+  <style>
+    :root{color-scheme:dark;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#090a0d;color:#f5f6f8;font-synthesis:none;text-rendering:optimizeLegibility;--muted:#9198a6;--line:#282d38;--panel:#11141a;--accent:#f3f5f8;--green:#76e0a3;--red:#ff8e9b}
+    *{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(ellipse 70% 40% at 50% -5%,#222633 0%,#101218 40%,#090a0d 80%);padding:34px 18px 44px}
+    .shell{width:min(900px,100%);margin:0 auto}.top{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:0 0 28px}.brand{display:flex;align-items:center;gap:12px}.mark{width:42px;height:42px;border:1px solid #414755;border-radius:13px;display:grid;place-items:center;font-weight:900;letter-spacing:-2px;font-size:19px;background:linear-gradient(145deg,#252a35,#11141a)}.brand-name{font-weight:850;letter-spacing:-.7px;font-size:23px}.brand-sub{color:var(--muted);font-size:12px;margin-top:3px}.pill{border:1px solid #333a47;border-radius:999px;color:#b6bdc9;padding:7px 11px;font-size:11px;letter-spacing:.12em;text-transform:uppercase;white-space:nowrap}
+    .hero{margin-bottom:23px}.eyebrow{font-size:11px;text-transform:uppercase;letter-spacing:.16em;color:#a8b0bd;font-weight:750}.hero h1{font-size:clamp(30px,5vw,47px);line-height:1.06;letter-spacing:-1.8px;margin:11px 0 12px}.hero p{color:var(--muted);line-height:1.65;max-width:650px;margin:0;font-size:14px}
+    .panel{background:linear-gradient(180deg,#14171e,#101217);border:1px solid #2a2e38;border-radius:22px;padding:24px;box-shadow:0 24px 75px #0004}.section-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:15px}.section-head h2{font-size:15px;margin:0;font-weight:750}.section-head span{font-size:12px;color:var(--muted)}.file-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.file-card{display:block;min-width:0;padding:16px;border:1px solid #2c323e;background:#0c0e13;border-radius:15px;cursor:pointer;transition:border-color .15s,background .15s}.file-card:hover{border-color:#667084;background:#10131a}.file-card.wide{grid-column:1/-1}.file-top{display:flex;align-items:center;gap:11px}.file-icon{width:37px;height:37px;flex:0 0 auto;border:1px solid #343b49;border-radius:11px;display:grid;place-items:center;background:#181c25;color:#d9deea;font-size:11px;font-weight:850;letter-spacing:.02em}.file-title{font-size:13px;font-weight:750}.file-desc{font-size:11px;color:var(--muted);margin-top:4px}.file-name{margin-top:13px;font-size:12px;color:#d4d9e2;overflow-wrap:anywhere;line-height:1.4}.file-name.empty{color:#697180}.file-card input{display:block;width:100%;margin-top:13px;font-size:11px;color:#aeb5c2}.file-card input::file-selector-button{background:#242936;border:1px solid #3c4352;border-radius:8px;color:#f2f3f7;padding:7px 9px;margin-right:9px;cursor:pointer}
+    .divider{height:1px;background:#282d37;margin:23px 0}.fields{display:grid;grid-template-columns:1fr 1fr;gap:14px}.field{min-width:0}.field label{display:block;color:#b8bfca;font-size:12px;font-weight:650;margin-bottom:7px}.field input{width:100%;border:1px solid #303643;border-radius:11px;background:#0b0d12;color:#f5f6f8;padding:12px 13px;font:inherit;font-size:13px;outline:none}.field input:focus{border-color:#7d879b;box-shadow:0 0 0 3px #626d8222}.field input::placeholder{color:#606878}.option-row{display:flex;align-items:center;justify-content:space-between;gap:15px;flex-wrap:wrap;margin:17px 0 21px}.check{display:flex;align-items:center;gap:9px;font-size:12px;color:#c0c6d0}.check input{accent-color:#f4f5f7;width:15px;height:15px}.helper{font-size:11px;color:#7f8796;line-height:1.6}
+    button.primary{width:100%;border:0;border-radius:12px;background:#f3f5f8;color:#090a0d;padding:15px 18px;font-weight:850;font-size:14px;cursor:pointer;transition:transform .15s,opacity .15s}button.primary:hover:not(:disabled){transform:translateY(-1px)}button.primary:disabled{opacity:.4;cursor:not-allowed}
+    .status{display:none;margin-top:17px;border:1px solid #303643;background:#0b0d12;border-radius:14px;padding:16px}.status.show{display:block}.status.error{border-color:#6c3640}.status.success{border-color:#2b6848}.status-title{font-size:13px;font-weight:800}.status-copy{font-size:12px;color:var(--muted);margin-top:7px;line-height:1.55;overflow-wrap:anywhere}.progress-track{height:5px;background:#252a34;border-radius:99px;overflow:hidden;margin-top:14px}.progress-bar{width:0;height:100%;background:#e9edf4;transition:width .2s}.steps{display:flex;gap:8px;flex-wrap:wrap;margin-top:13px}.step{font-size:10px;padding:5px 8px;border:1px solid #303642;border-radius:7px;color:#7e8796}.step.active{border-color:#757f91;color:#f0f2f7;background:#1b1f28}.step.done{color:var(--green);border-color:#284d3b}.download{display:inline-flex;align-items:center;gap:8px;margin-top:13px;color:#090a0d;background:#f3f5f8;text-decoration:none;font-size:12px;font-weight:850;padding:10px 13px;border-radius:9px}.notice{margin-top:17px;padding:13px 15px;border:1px solid #252a33;border-radius:12px;display:flex;gap:10px;color:#929aa8;font-size:11px;line-height:1.6}.notice strong{color:#c5cbd5;font-weight:700}.footer{display:flex;justify-content:space-between;gap:12px;margin-top:18px;color:#626b79;font-size:10px;line-height:1.6}
+    @media(max-width:620px){body{padding:20px 12px 30px}.top{margin-bottom:23px}.pill{font-size:9px}.panel{padding:15px;border-radius:18px}.file-grid,.fields{grid-template-columns:1fr}.file-card.wide{grid-column:auto}.hero h1{letter-spacing:-1.3px}.footer{flex-direction:column}.section-head{align-items:flex-start;flex-direction:column;gap:5px}}
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="top">
+      <div class="brand"><div class="mark">x</div><div><div class="brand-name">xsigner</div><div class="brand-sub">Private IPA signing workspace</div></div></div>
+      <div class="pill">rork-sign engine</div>
+    </header>
+    <section class="hero">
+      <div class="eyebrow">iOS app signing</div>
+      <h1>Sign your IPA.<br>Keep control of your files.</h1>
+      <p>Upload directly to private Backblaze storage, sign on Render with rork-sign, and download the completed IPA using a temporary link.</p>
+    </section>
+    <form id="sign-form" class="panel">
+      <div class="section-head"><h2>01 / Signing files</h2><span>Maximum IPA size: 4 GiB</span></div>
+      <div class="file-grid">
+        <label class="file-card wide" for="ipa"><div class="file-top"><div class="file-icon">IPA</div><div><div class="file-title">Application archive</div><div class="file-desc">Select the .ipa file you want to sign</div></div></div><div id="ipa-name" class="file-name empty">No IPA selected</div><input id="ipa" type="file" accept=".ipa,application/octet-stream" required></label>
+        <label class="file-card" for="certificate"><div class="file-top"><div class="file-icon">P12</div><div><div class="file-title">Signing certificate</div><div class="file-desc">.p12 or .pfx identity</div></div></div><div id="certificate-name" class="file-name empty">No certificate selected</div><input id="certificate" type="file" accept=".p12,.pfx,application/x-pkcs12" required></label>
+        <label class="file-card" for="profile"><div class="file-top"><div class="file-icon">MP</div><div><div class="file-title">Provisioning profile</div><div class="file-desc">.mobileprovision profile</div></div></div><div id="profile-name" class="file-name empty">No profile selected</div><input id="profile" type="file" accept=".mobileprovision,application/octet-stream" required></label>
+      </div>
+      <div class="divider"></div>
+      <div class="section-head"><h2>02 / Signing options</h2><span>Optional overrides</span></div>
+      <div class="fields">
+        <div class="field"><label for="password">P12 / PFX password</label><input id="password" type="password" autocomplete="off" spellcheck="false" placeholder="Certificate password (if required)"></div>
+        <div class="field"><label for="bundle-id">Bundle identifier</label><input id="bundle-id" type="text" autocomplete="off" spellcheck="false" placeholder="com.example.app"></div>
+        <div class="field"><label for="bundle-name">App display name</label><input id="bundle-name" type="text" autocomplete="off" placeholder="Leave unchanged"></div>
+        <div class="field"><label for="bundle-version">App version</label><input id="bundle-version" type="text" autocomplete="off" placeholder="Leave unchanged"></div>
+      </div>
+      <div class="option-row"><label class="check"><input id="sha256-only" type="checkbox"> Use SHA-256-only CodeDirectory</label><span class="helper">Credentials are removed from storage after signing.</span></div>
+      <button id="submit" class="primary" type="submit">Upload files & sign IPA</button>
+      <section id="status" class="status" aria-live="polite">
+        <div id="status-title" class="status-title">Preparing your job</div><div id="status-copy" class="status-copy"></div>
+        <div class="progress-track"><div id="progress-bar" class="progress-bar"></div></div>
+        <div id="steps" class="steps"></div><div id="download-area"></div>
+      </section>
+      <div class="notice"><span>ⓘ</span><div><strong>Privacy and expiry.</strong> File transfers go directly from your browser to the private B2 bucket. The signing worker temporarily downloads files to Render. Source IPAs, certificates and profiles are deleted after signing; completed downloads expire after 24 hours. Abandoned uploads expire automatically.</div></div>
+    </form>
+    <footer class="footer"><span>© xsigner · rork-sign</span><span>Private B2 object storage · Temporary signed download links</span></footer>
+  </main>
+<script>
+const form = document.querySelector('#sign-form');
+const submitButton = document.querySelector('#submit');
+const statusBox = document.querySelector('#status');
+const statusTitle = document.querySelector('#status-title');
+const statusCopy = document.querySelector('#status-copy');
+const progressBar = document.querySelector('#progress-bar');
+const stepsNode = document.querySelector('#steps');
+const downloadArea = document.querySelector('#download-area');
+const inputFiles = {ipa: document.querySelector('#ipa'), certificate: document.querySelector('#certificate'), profile: document.querySelector('#profile')};
+const phaseSteps = [
+  ['uploading','Uploading to B2'], ['queued','Queued'], ['downloading','Preparing files'], ['signing','Signing'], ['uploading_result','Saving result'], ['completed','Complete']
+];
+let currentToken = null;
+let totalBytes = 0;
+let uploadedBytes = 0;
+const inFlightProgress = new Map();
+
+const formatBytes = (n) => { if (!Number.isFinite(n)) return ''; const u=['B','KB','MB','GB','TB']; let i=0,v=n; while(v>=1024&&i<u.length-1){v/=1024;i++;} return `${v.toFixed(i===0?0:1)} ${u[i]}`; };
+const api = async (url, body, token = currentToken) => {
+  const response = await fetch(url, {method: 'POST', headers: {'Content-Type':'application/json', ...(token ? {'Authorization':`Bearer ${token}`} : {})}, body: JSON.stringify(body)});
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
+  return data;
+};
+function showStatus(title, copy, state = '') {
+  statusBox.className = `status show ${state}`;
+  statusTitle.textContent = title;
+  statusCopy.textContent = copy || '';
+}
+function setProgress(pct) { progressBar.style.width = `${Math.max(0, Math.min(100, pct))}%`; }
+function drawSteps(current) {
+  const currentIndex = phaseSteps.findIndex(([key]) => key === current);
+  stepsNode.innerHTML = '';
+  phaseSteps.forEach(([key, label], i) => {
+    const span = document.createElement('span');
+    span.className = 'step' + (i < currentIndex ? ' done' : i === currentIndex ? ' active' : '');
+    span.textContent = label;
+    stepsNode.appendChild(span);
+  });
+}
+function refreshUploadProgress() {
+  const inflight = [...inFlightProgress.values()].reduce((a,b)=>a+b,0);
+  const pct = totalBytes ? Math.round(((uploadedBytes + inflight) / totalBytes) * 100) : 0;
+  setProgress(pct);
+  statusCopy.textContent = `Uploading directly to Backblaze B2 · ${formatBytes(Math.min(totalBytes, uploadedBytes + inflight))} of ${formatBytes(totalBytes)}`;
+}
+function xhrUpload(url, blob, key) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', url, true);
+    xhr.upload.onprogress = event => {
+      if (event.lengthComputable) { inFlightProgress.set(key, event.loaded); refreshUploadProgress(); }
+    };
+    xhr.onload = () => {
+      inFlightProgress.delete(key);
+      if (xhr.status >= 200 && xhr.status < 300) {
+        const etag = xhr.getResponseHeader('ETag');
+        if (!etag) return reject(new Error('B2 did not expose the ETag header. Check the bucket CORS settings.'));
+        uploadedBytes += blob.size;
+        refreshUploadProgress();
+        resolve(etag);
+      } else reject(new Error(`B2 upload failed (HTTP ${xhr.status}). Check bucket CORS and try again.`));
+    };
+    xhr.onerror = () => { inFlightProgress.delete(key); reject(new Error('Could not reach Backblaze B2. Check bucket CORS and your connection.')); };
+    xhr.onabort = () => { inFlightProgress.delete(key); reject(new Error('Upload was cancelled.')); };
+    xhr.send(blob);
+  });
+}
+async function uploadOneFile(job, kind, file) {
+  const partSize = job.partSizeBytes;
+  const partCount = job.files[kind].partCount;
+  const etags = new Array(partCount);
+  const batchSize = 16;
+  for (let first = 1; first <= partCount; first += batchSize) {
+    const numbers = Array.from({length: Math.min(batchSize, partCount - first + 1)}, (_,i)=>first+i);
+    const signed = await api(`/api/jobs/${job.jobId}/part-urls`, {kind, partNumbers: numbers});
+    const urlMap = new Map(signed.urls.map(item => [item.partNumber, item.url]));
+    for (let at = 0; at < numbers.length; at += 3) {
+      const group = numbers.slice(at, at + 3);
+      await Promise.all(group.map(async partNumber => {
+        const start = (partNumber - 1) * partSize;
+        const end = Math.min(file.size, start + partSize);
+        const chunk = file.slice(start, end);
+        const etag = await xhrUpload(urlMap.get(partNumber), chunk, `${kind}:${partNumber}`);
+        etags[partNumber - 1] = {partNumber, etag};
+      }));
+    }
+  }
+  await api(`/api/jobs/${job.jobId}/complete-upload`, {kind, parts: etags});
+}
+function titleForPhase(phase) {
+  return ({uploading:'Uploading your files',ready_to_sign:'Files uploaded',queued:'Signing job queued',downloading:'Preparing the signing workspace',signing:'Signing IPA with rork-sign',uploading_result:'Saving the signed IPA to B2',completed:'Your IPA is ready',failed:'Signing failed'})[phase] || 'Working on your IPA';
+}
+async function pollJob(jobId, token) {
+  while (true) {
+    await new Promise(resolve => setTimeout(resolve, 1800));
+    const response = await fetch(`/api/jobs/${jobId}`, {headers:{'Authorization':`Bearer ${token}`, 'Cache-Control':'no-store'}});
+    const job = await response.json().catch(()=>({}));
+    if (!response.ok) throw new Error(job.error || 'Could not check the signing job.');
+    drawSteps(job.phase);
+    showStatus(titleForPhase(job.phase), job.status === 'failed' ? (job.error || 'Signing failed.') : job.phase === 'signing' ? 'rork-sign is processing the IPA. Large apps can take several minutes.' : job.phase === 'downloading' ? 'Downloading the input files from private B2 storage.' : job.phase === 'uploading_result' ? 'Signing finished. Uploading the signed IPA to private B2 storage.' : 'Your job is being processed securely. Keep this tab open until the download is ready.', job.status === 'failed' ? 'error' : '');
+    setProgress(job.progress || 0);
+    if (job.status === 'failed') throw new Error(job.error || 'Signing failed.');
+    if (job.status === 'completed') {
+      const signed = await api(`/api/jobs/${jobId}/download-url`, {}, token);
+      showStatus('Signed successfully', `Output size: ${formatBytes(job.resultSize)}. The download link expires in one hour and the stored IPA expires after 24 hours.`, 'success');
+      setProgress(100); drawSteps('completed');
+      const link = document.createElement('a'); link.className = 'download'; link.href = signed.url; link.textContent = 'Download signed IPA ↗';
+      link.rel = 'noopener'; link.target = '_blank'; downloadArea.replaceChildren(link);
+      return;
+    }
+  }
+}
+
+for (const [kind, input] of Object.entries(inputFiles)) {
+  input.addEventListener('change', () => {
+    const nameNode = document.querySelector(`#${kind}-name`);
+    const file = input.files?.[0];
+    nameNode.textContent = file ? `${file.name} · ${formatBytes(file.size)}` : ({ipa:'No IPA selected',certificate:'No certificate selected',profile:'No profile selected'})[kind];
+    nameNode.classList.toggle('empty', !file);
+  });
+}
+form.addEventListener('submit', async event => {
+  event.preventDefault();
+  if (!Object.values(inputFiles).every(el => el.files?.[0])) return;
+  const files = Object.fromEntries(Object.entries(inputFiles).map(([kind, input]) => {
+    const file = input.files[0]; return [kind, {name:file.name,size:file.size,type:file.type || 'application/octet-stream'}];
+  }));
+  const passwordField = document.querySelector('#password');
+  submitButton.disabled = true;
+  downloadArea.replaceChildren(); stepsNode.replaceChildren(); setProgress(0);
+  uploadedBytes = 0; totalBytes = Object.values(files).reduce((sum,file)=>sum+file.size,0); inFlightProgress.clear();
+  showStatus('Preparing upload', 'Creating a private multipart upload for your files.');
+  try {
+    const job = await api('/api/jobs', {files}, null);
+    currentToken = job.jobToken;
+    drawSteps('uploading');
+    for (const kind of ['ipa','certificate','profile']) await uploadOneFile(job, kind, inputFiles[kind].files[0]);
+    showStatus('Files uploaded', 'All three files are securely stored. Queueing rork-sign.');
+    drawSteps('queued'); setProgress(8);
+    const queued = await api(`/api/jobs/${job.jobId}/sign`, {
+      password: passwordField.value,
+      bundleId: document.querySelector('#bundle-id').value,
+      bundleName: document.querySelector('#bundle-name').value,
+      bundleVersion: document.querySelector('#bundle-version').value,
+      sha256Only: document.querySelector('#sha256-only').checked
+    });
+    passwordField.value = '';
+    await pollJob(queued.jobId, currentToken);
+  } catch (error) {
+    passwordField.value = '';
+    showStatus('Could not finish signing', error.message || 'Unexpected error. Please retry.', 'error');
+    drawSteps('failed');
+  } finally {
+    submitButton.disabled = false;
+    currentToken = null;
+  }
+});
+</script>
+</body>
+</html>
