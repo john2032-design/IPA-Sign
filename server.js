@@ -241,6 +241,9 @@ app.post('/api/jobs', createLimiter, async (req, res) => {
   try {
     for (const kind of Object.keys(specs)) {
       const metadata = normalized[kind];
+      // Optional uploads (icon, dylib, deb) are absent unless selected.
+      // Do not attempt to create a multipart upload for a missing file.
+      if (!metadata) continue;
       const key = `uploads/${id}/${kind}${path.extname(metadata.name).toLowerCase()}`;
       const result = await getS3().send(new CreateMultipartUploadCommand({
         Bucket: BUCKET, Key: key, ContentType: metadata.contentType,
@@ -259,7 +262,13 @@ app.post('/api/jobs', createLimiter, async (req, res) => {
   } catch (error) {
     await cleanupInputs(manifest).catch(() => {});
     await removeObject(s3KeyForManifest(id));
-    console.error('job creation failed:', messageOf(error));
+    console.error('job creation failed:', JSON.stringify({
+      message: messageOf(error),
+      name: error?.name || null,
+      code: error?.Code || error?.code || null,
+      httpStatusCode: error?.$metadata?.httpStatusCode || null,
+      requestId: error?.$metadata?.requestId || null
+    }));
     res.status(503).json({error: 'Could not start a Backblaze upload. Check the B2 bucket, credentials, and permissions.'});
   }
 });
