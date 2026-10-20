@@ -1,0 +1,47 @@
+services:
+  - type: web
+    name: xsigner
+    runtime: docker
+    region: ohio
+    plan: standard
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeploy: true
+    disk:
+      name: xsigner-work
+      mountPath: /data
+      sizeGB: 40
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATA_DIR
+        value: /data
+      - key: RORKSIGN_BIN
+        value: /usr/local/bin/rorksign
+      - key: MAX_IPA_BYTES
+        value: "4294967296"
+      - key: MAX_CONCURRENT_JOBS
+        value: "1"
+      - key: PART_SIZE_BYTES
+        value: "67108864"
+      - key: JOB_TTL_HOURS
+        value: "24"
+      - key: UPLOAD_TTL_HOURS
+        value: "6"
+      - key: SIGN_TIMEOUT_MS
+        value: "2700000"
+      - key: PUBLIC_ORIGIN
+        value: https://xsigner.onrender.com
+      - key: B2_ENDPOINT
+        value: https://s3.us-east-005.backblazeb2.com
+      - key: B2_REGION
+        value: us-east-005
+      - key: B2_BUCKET
+        value: ipa-xsigner
+      - key: B2_KEY_ID
+        sync: false
+      - key: B2_APPLICATION_KEY
+        sync: false
+      - key: JOB_ENCRYPTION_KEY
+        generateValue: true
