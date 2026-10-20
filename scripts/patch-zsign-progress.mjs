@@ -47,21 +47,20 @@ replaceExactlyOnce(
   'the include section'
 );
 
-replaceExactlyOnce(
-  '\t\t\t} else {\n' +
-  '\t\t\t\tZLog::WarnV(">>> Warning: Skipping non-Mach-O file: \\t%s\\n", strFile.c_str());\n' +
-  '\t\t\t}\n' +
-  '\t\t}\n' +
-  '\t}\n\n' +
-  '\tif (jvNode.has("folders")) {',
-  '\t\t\t} else {\n' +
-  '\t\t\t\tZLog::WarnV(">>> Warning: Skipping non-Mach-O file: \\t%s\\n", strFile.c_str());\n' +
-  '\t\t\t}\n' +
-  '\t\t\t++gXsignProgressDone;\n' +
-  '\t\t\tPrintZsignProgress();\n' +
-  '\t\t}\n' +
-  '\t}\n\n' +
-  '\tif (jvNode.has("folders")) {',
+// Use the warning line plus the surrounding loop braces rather than a full
+// multi-line literal. Upstream changes to the warning's escaped tab/newline
+// text should not break the instrumentation patch.
+function replaceRegexExactlyOnce(pattern, replacement, label) {
+  const matches = [...source.matchAll(pattern)];
+  if (matches.length !== 1) {
+    throw new Error(`Expected exactly one upstream source anchor for ${label}; found ${matches.length}. Refusing to build an incorrectly patched signer.`);
+  }
+  source = source.replace(pattern, replacement);
+}
+
+replaceRegexExactlyOnce(
+  /(ZLog::WarnV\(">>> Warning: Skipping non-Mach-O file:[^\n]*\n\t\t\t\}\n)(\t\t\})/g,
+  '$1\t\t\t++gXsignProgressDone;\n\t\t\tPrintZsignProgress();\n$2',
   'the per-file signing loop'
 );
 
