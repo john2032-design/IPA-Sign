@@ -45,3 +45,7 @@ services:
         sync: false
       - key: JOB_ENCRYPTION_KEY
         generateValue: true
+      - key: RECAPTCHA_SECRET_KEY
+        sync: false
+      - key: RECAPTCHA_ALLOWED_HOSTNAMES
+        value: xsigner.onrender.com

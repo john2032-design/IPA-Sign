@@ -6,7 +6,9 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import {spawn} from 'node:child_process';
+import {spawn, execFile} from 'node:child_process';
+import {promisify} from 'node:util';
+import multer from 'multer';
 import {pipeline} from 'node:stream/promises';
 import {Transform} from 'node:stream';
 import {
@@ -36,6 +38,10 @@ const STALE_JOB_MS = Number(process.env.STALE_JOB_MINUTES || 45) * 60 * 1000;
 const MAX_CONCURRENT_JOBS = Math.max(1, Number(process.env.MAX_CONCURRENT_JOBS || 1));
 const PUBLIC_ORIGIN = process.env.PUBLIC_ORIGIN || '';
 const JOB_ENCRYPTION_KEY = process.env.JOB_ENCRYPTION_KEY || '';
+const RECAPTCHA_SECRET_KEY = process.env.RECAPTCHA_SECRET_KEY || '';
+const CERT_API_BASE = 'https://sideloading.net/api/certificates';
+const execFileAsync = promisify(execFile);
+const checkerUpload = multer({storage: multer.memoryStorage(), limits: {fileSize: 32 * 1024 * 1024, files: 2, fields: 3}}).fields([{name: 'p12', maxCount: 1}, {name: 'mobileprovision', maxCount: 1}]);
 
 await fsp.mkdir(WORK_ROOT, {recursive: true});
 
@@ -181,13 +187,15 @@ app.get('/health', (_req, res) => res.status(200).json({
   signerPresent: fs.existsSync(SIGNER),
   storageConfigured: storageConfigured(),
   encryptionConfigured: Boolean(JOB_ENCRYPTION_KEY),
+  recaptchaConfigured: Boolean(RECAPTCHA_SECRET_KEY),
   diskPath: ROOT
 }));
 app.get('/api/config', (_req, res) => res.json({
   maxIpaBytes: MAX_IPA_BYTES,
   maxSmallFileBytes: MAX_SMALL_FILE_BYTES,
   partSizeBytes: PART_SIZE,
-  publicOrigin: PUBLIC_ORIGIN || null
+  publicOrigin: PUBLIC_ORIGIN || null,
+  recaptchaSiteKey: '6Lfg6_gtAAAAAI9zK0Uvquy2dG2Qk7op92wVzXVH'
 }));
 
 app.post('/api/jobs', createLimiter, async (req, res) => {
@@ -196,14 +204,20 @@ app.post('/api/jobs', createLimiter, async (req, res) => {
   const provided = req.body?.files;
   if (!provided || typeof provided !== 'object') return res.status(400).json({error: 'File metadata is required.'});
   const specs = {
-    ipa: {ext: '.ipa', max: MAX_IPA_BYTES},
-    certificate: {exts: ['.p12', '.pfx'], max: MAX_SMALL_FILE_BYTES},
-    profile: {ext: '.mobileprovision', max: MAX_SMALL_FILE_BYTES}
+    ipa: {ext: '.ipa', max: MAX_IPA_BYTES, required: true},
+    certificate: {exts: ['.p12', '.pfx'], max: MAX_SMALL_FILE_BYTES, required: true},
+    profile: {ext: '.mobileprovision', max: MAX_SMALL_FILE_BYTES, required: true},
+    icon: {ext: '.png', max: MAX_SMALL_FILE_BYTES, required: false},
+    dylib: {ext: '.dylib', max: 128 * 1024 * 1024, required: false},
+    deb: {ext: '.deb', max: 256 * 1024 * 1024, required: false}
   };
   const normalized = {};
   for (const kind of Object.keys(specs)) {
     const item = provided[kind];
-    if (!item || typeof item !== 'object') return res.status(400).json({error: `Missing ${kind} file.`});
+    if (!item || typeof item !== 'object') {
+      if (specs[kind].required) return res.status(400).json({error: `Missing ${kind} file.`});
+      continue;
+    }
     const name = clampText(item.name, 240);
     const size = Number(item.size);
     if (!name || !Number.isSafeInteger(size) || size < 1 || size > specs[kind].max) {
@@ -221,7 +235,8 @@ app.post('/api/jobs', createLimiter, async (req, res) => {
     status: 'creating_uploads', phase: 'preparing', progress: 0,
     createdAt: Date.now(), updatedAt: Date.now(),
     uploads: {}, settings: null, passwordCipher: null,
-    resultKey: null, resultSize: null, error: null, logs: [], logSequence: 0
+    resultKey: null, resultSize: null, error: null, logs: [], logSequence: 0,
+    otaTokenHash: null, otaExpiresAt: null, otaMetadata: null
   };
   try {
     for (const kind of Object.keys(specs)) {
@@ -313,8 +328,25 @@ app.post('/api/jobs/:id/complete-upload', partLimiter, async (req, res) => {
 app.post('/api/jobs/:id/sign', actionLimiter, async (req, res) => {
   const manifest = await authorizedJob(req, res, req.params.id);
   if (!manifest) return;
-  if (manifest.status !== 'ready' || !Object.values(manifest.uploads || {}).every(value => value.completed)) {
-    return res.status(409).json({error: 'Upload all three files before signing.'});
+  if (manifest.status !== 'ready' || !['ipa', 'certificate', 'profile'].every(kind => manifest.uploads?.[kind]?.completed)) {
+    return res.status(409).json({error: 'Upload the IPA, P12, and mobileprovision before signing.'});
+  }
+  const captchaToken = typeof req.body?.captchaToken === 'string' ? req.body.captchaToken.trim() : '';
+  if (!captchaToken) return res.status(400).json({error: 'Complete the reCAPTCHA check before signing.'});
+  if (!RECAPTCHA_SECRET_KEY) return res.status(503).json({error: 'reCAPTCHA verification is not configured on the server. Add RECAPTCHA_SECRET_KEY in Render.'});
+  try {
+    const verifyBody = new URLSearchParams({secret: RECAPTCHA_SECRET_KEY, response: captchaToken});
+    if (req.ip) verifyBody.set('remoteip', req.ip);
+    const captchaResponse = await fetch('https://www.google.com/recaptcha/api/siteverify', {method: 'POST', headers: {'content-type': 'application/x-www-form-urlencoded'}, body: verifyBody, signal: AbortSignal.timeout(10_000)});
+    const captcha = await captchaResponse.json();
+    const expectedHosts = (process.env.RECAPTCHA_ALLOWED_HOSTNAMES || req.hostname || 'xsigner.onrender.com').split(',').map(value => value.trim().toLowerCase()).filter(Boolean);
+    if (!captchaResponse.ok || captcha.success !== true || !expectedHosts.includes(String(captcha.hostname || '').toLowerCase())) {
+      console.warn('reCAPTCHA rejected a signing request:', JSON.stringify({success: captcha.success === true, hostname: captcha.hostname || null, errors: captcha['error-codes'] || []}));
+      return res.status(403).json({error: 'reCAPTCHA verification failed or expired. Complete the checkbox again and retry.'});
+    }
+  } catch (error) {
+    console.error('reCAPTCHA verification unavailable:', messageOf(error));
+    return res.status(503).json({error: 'Google reCAPTCHA verification is temporarily unavailable. Please retry.'});
   }
   const password = typeof req.body?.password === 'string' ? req.body.password : '';
   if (password.length > 2048) return res.status(400).json({error: 'P12 password is too long.'});
@@ -324,7 +356,7 @@ app.post('/api/jobs/:id/sign', actionLimiter, async (req, res) => {
   const bundleVersion = clampText(req.body?.bundleVersion, 100);
   if (bundleVersion && !/^[A-Za-z0-9._+-]+$/.test(bundleVersion)) return res.status(400).json({error: 'Version format is invalid.'});
   try {
-    manifest.settings = {bundleId, bundleName, bundleVersion};
+    manifest.settings = {bundleId, bundleName, bundleVersion, injectExtensions: req.body?.injectExtensions === true};
     manifest.passwordCipher = encryptPassword(password);
     manifest.status = 'queued'; manifest.phase = 'queued'; manifest.progress = 64; manifest.error = null;
     appendJobLog(manifest, 'Job queued. Waiting for a zsign worker.', 'system', password);
@@ -345,6 +377,7 @@ app.get('/api/jobs/:id', pollLimiter, async (req, res) => {
     id: manifest.id, status: manifest.status, phase: manifest.phase,
     progress: Number(manifest.progress || 0), error: manifest.status === 'failed' ? manifest.error : null,
     resultSize: manifest.status === 'completed' ? manifest.resultSize : null,
+    appName: manifest.otaMetadata?.appName || manifest.settings?.bundleName || null,
     logSequence: Number(manifest.logSequence || 0),
     logs: (manifest.logs || []).filter(entry => Number(entry.id) > after).slice(-120)
   });
@@ -366,6 +399,105 @@ app.post('/api/jobs/:id/download-url', actionLimiter, async (req, res) => {
     res.status(503).json({error: 'Could not create the download link. Try again shortly.'});
   }
 });
+
+app.post('/api/jobs/:id/ota-url', actionLimiter, async (req, res) => {
+  const manifest = await authorizedJob(req, res, req.params.id);
+  if (!manifest) return;
+  if (manifest.status !== 'completed' || !manifest.resultKey) return res.status(409).json({error: 'Signed IPA is not ready for OTA installation.'});
+  const metadata = manifest.otaMetadata || {};
+  if (!metadata.bundleId) return res.status(409).json({error: 'Could not determine the app Bundle ID. Add a Bundle ID in Advanced options and sign again to enable OTA installation.'});
+  try {
+    const installToken = crypto.randomBytes(32).toString('base64url');
+    manifest.otaTokenHash = hashToken(installToken).toString('hex');
+    manifest.otaExpiresAt = Date.now() + 24 * 60 * 60 * 1000;
+    await putManifest(manifest);
+    const baseOrigin = (PUBLIC_ORIGIN || 'https://xsigner.onrender.com').replace(/\/+$/, '');
+    const manifestUrl = `${baseOrigin}/ota/${manifest.id}/${installToken}/manifest.plist`;
+    const installUrl = `itms-services://?action=download-manifest&url=${encodeURIComponent(manifestUrl)}`;
+    res.set('Cache-Control', 'no-store').json({
+      appName: metadata.appName || 'Signed app', bundleId: metadata.bundleId,
+      version: metadata.version || '1.0', manifestUrl, installUrl,
+      expiresAt: manifest.otaExpiresAt
+    });
+  } catch (error) {
+    console.error('OTA link generation failed:', messageOf(error));
+    res.status(503).json({error: 'Could not create the OTA installation link.'});
+  }
+});
+
+app.get('/ota/:id/:token/manifest.plist', async (req, res) => {
+  const {id, token} = req.params;
+  if (!validateId(id)) return res.status(404).type('text').send('Not found');
+  try {
+    const manifest = await maybeManifest(id);
+    if (!manifest || manifest.status !== 'completed' || !manifest.resultKey || !manifest.otaTokenHash || !tokenMatches(token, manifest.otaTokenHash) || Date.now() > Number(manifest.otaExpiresAt || 0)) {
+      return res.status(404).type('text').send('Installation link expired or unavailable');
+    }
+    const metadata = manifest.otaMetadata || {};
+    if (!metadata.bundleId) return res.status(409).type('text').send('The signed app is missing its Bundle ID.');
+    const ipaUrl = await getSignedUrl(getS3(), new GetObjectCommand({Bucket: BUCKET, Key: manifest.resultKey, ResponseContentType: 'application/octet-stream'}), {expiresIn: 4 * 60 * 60});
+    const escapeXml = value => String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;').replace(/'/g, '&apos;');
+    const title = escapeXml(metadata.appName || 'Signed app');
+    const bundleId = escapeXml(metadata.bundleId);
+    const version = escapeXml(metadata.version || '1.0');
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>items</key><array><dict><key>assets</key><array><dict><key>kind</key><string>software-package</string><key>url</key><string>${escapeXml(ipaUrl)}</string></dict></array><key>metadata</key><dict><key>bundle-identifier</key><string>${bundleId}</string><key>bundle-version</key><string>${version}</string><key>kind</key><string>software</string><key>title</key><string>${title}</string></dict></dict></array></dict></plist>`;
+    res.set({'Content-Type': 'application/xml; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'}).send(xml);
+  } catch (error) {
+    console.error('OTA manifest failed:', messageOf(error));
+    res.status(503).type('text').send('Could not generate installation manifest');
+  }
+});
+
+async function runCommand(command, args, {cwd, timeout = 60_000} = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {cwd, stdio: ['ignore', 'pipe', 'pipe'], env: {...process.env, NO_COLOR: '1', TERM: 'dumb'}});
+    let stdout = '', stderr = '';
+    child.stdout.on('data', chunk => { if (stdout.length < 1_000_000) stdout += chunk.toString('utf8').slice(0, 1_000_000 - stdout.length); });
+    child.stderr.on('data', chunk => { if (stderr.length < 1_000_000) stderr += chunk.toString('utf8').slice(0, 1_000_000 - stderr.length); });
+    const timer = setTimeout(() => child.kill('SIGTERM'), timeout);
+    child.on('error', error => { clearTimeout(timer); reject(error); });
+    child.on('close', code => {
+      clearTimeout(timer);
+      if (code !== 0) reject(new Error(`${command} failed (${code}): ${(stderr || stdout).slice(-1000)}`));
+      else resolve({stdout, stderr});
+    });
+  });
+}
+async function readIpaMetadata(ipaPath) {
+  const listing = await execFileAsync('unzip', ['-Z1', ipaPath], {encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 60_000});
+  const candidates = String(listing.stdout).split(/\r?\n/).filter(name => /^Payload\/[^/]+\.app\/Info\.plist$/.test(name));
+  const infoPath = candidates.sort((a, b) => a.length - b.length)[0];
+  if (!infoPath) throw new Error('IPA does not contain a root app Info.plist.');
+  const plistResult = await execFileAsync('unzip', ['-p', ipaPath, infoPath], {encoding: 'buffer', maxBuffer: 16 * 1024 * 1024, timeout: 60_000});
+  const buffer = Buffer.isBuffer(plistResult.stdout) ? plistResult.stdout : Buffer.from(plistResult.stdout);
+  return await new Promise((resolve, reject) => {
+    const script = "import plistlib,json,sys; d=plistlib.loads(sys.stdin.buffer.read()); keys=['CFBundleIdentifier','CFBundleDisplayName','CFBundleName','CFBundleShortVersionString','CFBundleVersion']; print(json.dumps({k:d.get(k) for k in keys if isinstance(d.get(k),(str,int,float))}))";
+    const child = spawn('python3', ['-c', script], {stdio: ['pipe', 'pipe', 'pipe']});
+    let out = '', err = '';
+    child.stdout.on('data', chunk => out += chunk.toString('utf8'));
+    child.stderr.on('data', chunk => err += chunk.toString('utf8'));
+    child.on('error', reject);
+    child.on('close', code => {
+      if (code !== 0) return reject(new Error(`Could not parse app Info.plist: ${err.slice(-500)}`));
+      try { resolve(JSON.parse(out)); } catch (error) { reject(error); }
+    });
+    child.stdin.end(buffer);
+  });
+}
+async function findFilesByExtension(root, extension) {
+  const result = [];
+  async function visit(dir) {
+    for (const entry of await fsp.readdir(dir, {withFileTypes: true})) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) await visit(full);
+      else if (entry.isFile() && path.extname(entry.name).toLowerCase() === extension) result.push(full);
+    }
+  }
+  await visit(root);
+  return result;
+}
 
 async function writeB2ObjectToFile(key, destination, onBytes = () => {}) {
   const response = await getS3().send(new GetObjectCommand({Bucket: BUCKET, Key: key}));
@@ -522,7 +654,7 @@ async function runSigningJob(id) {
     const local = {};
     const totalInputBytes = Object.values(manifest.uploads || {}).reduce((sum, upload) => sum + Number(upload.expectedSize || 0), 0);
     let downloadedInputBytes = 0;
-    for (const kind of ['ipa', 'certificate', 'profile']) {
+    for (const kind of Object.keys(manifest.uploads || {})) {
       const upload = manifest.uploads[kind];
       local[kind] = path.join(workDir, `input-${kind}${path.extname(upload.filename).toLowerCase()}`);
       appendJobLog(manifest, `Downloading ${kind} (${upload.filename}, ${upload.expectedSize} bytes).`, 'system', password);
@@ -536,6 +668,31 @@ async function runSigningJob(id) {
       appendJobLog(manifest, `Verified ${kind} on the signing worker (${info.size} bytes).`, 'system', password);
       await flushManifest(manifest);
     }
+    const inputMetadata = await readIpaMetadata(local.ipa).catch(error => {
+      appendJobLog(manifest, `Could not read IPA metadata automatically: ${messageOf(error)}`, 'stderr', password);
+      return {};
+    });
+    const finalMetadata = {
+      bundleId: manifest.settings?.bundleId || inputMetadata.CFBundleIdentifier || '',
+      appName: manifest.settings?.bundleName || inputMetadata.CFBundleDisplayName || inputMetadata.CFBundleName || path.basename(manifest.uploads.ipa.filename, path.extname(manifest.uploads.ipa.filename)),
+      version: manifest.settings?.bundleVersion || inputMetadata.CFBundleShortVersionString || inputMetadata.CFBundleVersion || '1.0'
+    };
+    manifest.otaMetadata = finalMetadata;
+    await flushManifest(manifest);
+
+    const dylibsToInject = [];
+    if (local.dylib) dylibsToInject.push(local.dylib);
+    if (local.deb) {
+      const extractedDeb = path.join(workDir, 'deb-extracted');
+      await fsp.mkdir(extractedDeb, {recursive: true});
+      appendJobLog(manifest, 'Extracting the uploaded .deb package to find injectable .dylib files.', 'system', password);
+      await runCommand('dpkg-deb', ['-x', local.deb, extractedDeb], {cwd: workDir, timeout: 120_000});
+      const foundDylibs = await findFilesByExtension(extractedDeb, '.dylib');
+      if (foundDylibs.length === 0) throw new Error('The uploaded .deb contains no .dylib files to inject. Upload a tweak package that contains a compatible dylib.');
+      if (foundDylibs.length > 8) throw new Error('The uploaded .deb contains more than 8 dylib files. Please use a smaller package or upload a specific .dylib.');
+      dylibsToInject.push(...foundDylibs);
+      appendJobLog(manifest, `Found ${foundDylibs.length} dylib file(s) in the .deb package.`, 'system', password);
+    }
     manifest.phase = 'signing'; manifest.progress = 70;
     appendJobLog(manifest, 'Starting upstream zsign CLI (version 1.1.2 build target).', 'system', password);
     await flushManifest(manifest);
@@ -546,6 +703,9 @@ async function runSigningJob(id) {
     if (manifest.settings?.bundleId) args.push('-b', manifest.settings.bundleId);
     if (manifest.settings?.bundleName) args.push('-n', manifest.settings.bundleName);
     if (manifest.settings?.bundleVersion) args.push('-r', manifest.settings.bundleVersion);
+    if (local.icon) args.push('-I', local.icon);
+    if (manifest.settings?.injectExtensions && dylibsToInject.length) args.push('-P');
+    for (const dylibPath of dylibsToInject) args.push('-l', dylibPath);
     const result = await spawnSigner(args, workDir, password, (line, stream) => {
       const clean = safeTerminalLine(line, password);
       if (!clean) return;
@@ -655,9 +815,103 @@ async function cleanupExpiredJobs() {
   }
 }
 
+// Public NexCerts index proxy. This keeps browser pages on the same origin and
+// does not store certificate files or passwords locally on this server.
+const listCertificatesHandler = async (req, res) => {
+  const allowed = new Set(['all', 'signed', 'revoked', 'missingP12']);
+  const status = req.params.status;
+  if (!allowed.has(status)) return res.status(400).json({error: 'Status must be all, signed, revoked, or missingP12.'});
+  let amount = '';
+  if (req.params.amount !== undefined) {
+    const count = Number(req.params.amount);
+    if (!Number.isInteger(count) || count < 1 || count > 500) return res.status(400).json({error: 'Amount must be an integer from 1 to 500.'});
+    amount = `/${count}`;
+  }
+  try {
+    const upstream = await fetch(`${CERT_API_BASE}/list/${status}${amount}`, {headers: {accept: 'application/json'}, signal: AbortSignal.timeout(20_000)});
+    const body = await upstream.text();
+    res.status(upstream.status).set('Cache-Control', 'public, max-age=60').type('application/json').send(body);
+  } catch (error) {
+    console.error('NexCerts list proxy failed:', messageOf(error));
+    res.status(502).json({error: 'Could not retrieve the certificate list from NexCerts.'});
+  }
+};
+app.get('/api/free-certificates/list/:status', actionLimiter, listCertificatesHandler);
+app.get('/api/free-certificates/list/:status/:amount', actionLimiter, listCertificatesHandler);
+
+app.get('/api/free-certificates/download/all.zip', actionLimiter, async (_req, res) => {
+  await proxyCertificateDownload('all.zip', null, null, res);
+});
+app.get('/api/free-certificates/download/missingP12/:id/:file', actionLimiter, async (req, res) => {
+  const id = req.params.id;
+  const file = req.params.file;
+  if (!/^\d+$/.test(id) || !['cert.zip', 'cert.mobileprovision'].includes(file)) return res.status(400).json({error: 'Invalid missing-P12 download request.'});
+  await proxyCertificateDownload(id, file, 'missingP12', res);
+});
+app.get('/api/free-certificates/download/:id/:file', actionLimiter, async (req, res) => {
+  const {id, file} = req.params;
+  if (!/^\d+$/.test(id) || !['cert.zip', 'cert.p12', 'cert.mobileprovision', 'password.txt', 'password'].includes(file)) return res.status(400).json({error: 'Invalid certificate download request.'});
+  await proxyCertificateDownload(id, file, null, res);
+});
+async function proxyCertificateDownload(idOrAll, file, status, res) {
+  try {
+    let url;
+    if (idOrAll === 'all.zip') url = `${CERT_API_BASE}/download/all.zip`;
+    else if (status === 'missingP12') url = `${CERT_API_BASE}/download/missingP12/${encodeURIComponent(idOrAll)}/${encodeURIComponent(file)}`;
+    else url = `${CERT_API_BASE}/download/${encodeURIComponent(idOrAll)}/${encodeURIComponent(file)}`;
+    const upstream = await fetch(url, {redirect: 'follow', signal: AbortSignal.timeout(90_000)});
+    if (!upstream.ok) {
+      const body = await upstream.text();
+      return res.status(upstream.status).type('application/json').send(body || JSON.stringify({error: 'Certificate file is not available.'}));
+    }
+    const contentType = upstream.headers.get('content-type') || (file === 'password' ? 'text/plain; charset=utf-8' : 'application/octet-stream');
+    res.set('Content-Type', contentType).set('Cache-Control', 'no-store');
+    const downloadName = file === 'password' ? `certificate-${idOrAll}-password.txt` : file || 'all-certs.zip';
+    if (!contentType.includes('application/json')) res.set('Content-Disposition', `attachment; filename="${downloadName.replace(/[^a-zA-Z0-9._-]/g, '_')}"`);
+    if (!upstream.body) return res.status(502).end();
+    const reader = upstream.body.getReader();
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      if (!res.write(Buffer.from(value))) await new Promise(resolve => res.once('drain', resolve));
+    }
+    res.end();
+  } catch (error) {
+    console.error('NexCerts download proxy failed:', messageOf(error));
+    if (!res.headersSent) res.status(502).json({error: 'Could not download the certificate file from NexCerts.'});
+    else res.end();
+  }
+}
+
+app.post('/api/certchecker/checkCert', actionLimiter, (req, res, next) => {
+  checkerUpload(req, res, error => error ? next(error) : next());
+}, async (req, res) => {
+  const p12 = req.files?.p12?.[0];
+  const mobileprovision = req.files?.mobileprovision?.[0];
+  const password = typeof req.body?.password === 'string' ? req.body.password : '';
+  if (!p12 && !mobileprovision) return res.status(400).json({error: 'Upload a P12 certificate, a mobileprovision file, or both.'});
+  if (p12 && !password) return res.status(400).json({error: 'P12 password is required when a P12 certificate is provided.'});
+  try {
+    const form = new FormData();
+    if (p12) form.append('p12', new Blob([p12.buffer], {type: p12.mimetype || 'application/x-pkcs12'}), path.basename(p12.originalname || 'certificate.p12'));
+    if (mobileprovision) form.append('mobileprovision', new Blob([mobileprovision.buffer], {type: mobileprovision.mimetype || 'application/octet-stream'}), path.basename(mobileprovision.originalname || 'profile.mobileprovision'));
+    if (p12) form.append('password', password);
+    const upstream = await fetch('https://sideloading.net/api/certchecker/checkCert', {method: 'POST', body: form, signal: AbortSignal.timeout(90_000)});
+    const body = await upstream.text();
+    res.status(upstream.status).set('Cache-Control', 'no-store').type('application/json').send(body);
+  } catch (error) {
+    console.error('NexCerts certificate check failed:', messageOf(error));
+    res.status(502).json({error: 'Certificate checking service is unavailable. Please retry.'});
+  } finally {
+    if (req.body) req.body.password = '';
+  }
+});
+
 app.use((error, _req, res, _next) => {
   console.error('request failed:', messageOf(error));
   if (res.headersSent) return;
+  if (error?.code === 'LIMIT_FILE_SIZE' || error?.code === 'LIMIT_FILE_COUNT') return res.status(413).json({error: 'Uploaded files exceed the certificate checker limits.'});
+  if (error?.name === 'MulterError') return res.status(400).json({error: 'Invalid certificate checker form upload.'});
   res.status(500).json({error: 'Unexpected server error.'});
 });
 
