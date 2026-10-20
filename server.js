@@ -38,6 +38,9 @@ const PART_SIZE = Number(process.env.PART_SIZE_BYTES || 64 * 1024 * 1024);
 const JOB_TTL_MS = Number(process.env.JOB_TTL_HOURS || 24) * 60 * 60 * 1000;
 const UPLOAD_TTL_MS = Number(process.env.UPLOAD_TTL_HOURS || 6) * 60 * 60 * 1000;
 const STALE_JOB_MS = Number(process.env.STALE_JOB_MINUTES || 45) * 60 * 1000;
+const SIGNED_IPA_RETENTION_MINUTES = Number.isFinite(Number(process.env.SIGNED_IPA_TTL_MINUTES)) && Number(process.env.SIGNED_IPA_TTL_MINUTES) > 0 ? Number(process.env.SIGNED_IPA_TTL_MINUTES) : 10;
+const SIGNED_IPA_RETENTION_MS = Math.max(60_000, SIGNED_IPA_RETENTION_MINUTES * 60 * 1000);
+const SIGNED_IPA_CLEANUP_INTERVAL_MS = Math.max(10_000, Number(process.env.SIGNED_IPA_CLEANUP_INTERVAL_MS) || 10_000);
 const MAX_CONCURRENT_JOBS = Math.max(1, Number(process.env.MAX_CONCURRENT_JOBS || 1));
 const PUBLIC_ORIGIN = process.env.PUBLIC_ORIGIN || '';
 const JOB_ENCRYPTION_KEY = process.env.JOB_ENCRYPTION_KEY || '';
@@ -45,6 +48,55 @@ const RECAPTCHA_SECRET_KEY = process.env.RECAPTCHA_SECRET_KEY || '';
 const CERT_API_BASE = 'https://sideloading.net/api/certificates';
 const execFileAsync = promisify(execFile);
 const checkerUpload = multer({storage: multer.memoryStorage(), limits: {fileSize: 32 * 1024 * 1024, files: 2, fields: 3}}).fields([{name: 'p12', maxCount: 1}, {name: 'mobileprovision', maxCount: 1}]);
+const API_SIGN_FILE_LIMITS = {
+  ipa: MAX_IPA_BYTES,
+  p12: MAX_SMALL_FILE_BYTES,
+  mobileprovision: MAX_SMALL_FILE_BYTES,
+  icon: MAX_SMALL_FILE_BYTES,
+  deb: 256 * 1024 * 1024,
+  dylib: 128 * 1024 * 1024
+};
+const apiSignStorage = {
+  _handleFile(_req, file, callback) {
+    const field = file.fieldname;
+    const maxBytes = API_SIGN_FILE_LIMITS[field];
+    if (!maxBytes) {
+      file.stream.resume();
+      return callback(Object.assign(new Error(`Unexpected file field: ${field}`), {status: 400}));
+    }
+    const filePath = path.join(WORK_ROOT, `discord-api-${crypto.randomUUID()}`);
+    let size = 0;
+    const limiter = new Transform({transform(chunk, _encoding, done) {
+      size += chunk.length;
+      if (size > maxBytes) return done(Object.assign(new Error(`${field} file exceeds the ${formatBytesSafe(maxBytes)} limit.`), {status: 413}));
+      done(null, chunk);
+    }});
+    pipeline(file.stream, limiter, fs.createWriteStream(filePath, {flags: 'wx', mode: 0o600}))
+      .then(() => callback(null, {path: filePath, filename: path.basename(filePath), size}))
+      .catch(error => { void fsp.rm(filePath, {force: true}).finally(() => callback(error)); });
+  },
+  _removeFile(_req, file, callback) {
+    fsp.rm(file.path, {force: true}).then(() => callback(null), callback);
+  }
+};
+const apiSignUpload = multer({
+  storage: apiSignStorage,
+  limits: {fileSize: MAX_IPA_BYTES, files: 6, fields: 12, parts: 18, fieldNameSize: 64, fieldSize: 4096},
+  fileFilter(_req, file, callback) {
+    const ext = path.extname(file.originalname || '').toLowerCase();
+    const allowed = {
+      ipa: ['.ipa'], p12: ['.p12', '.pfx'], mobileprovision: ['.mobileprovision'],
+      icon: ['.png'], deb: ['.deb'], dylib: ['.dylib']
+    };
+    if (!allowed[file.fieldname] || !allowed[file.fieldname].includes(ext)) {
+      return callback(Object.assign(new Error(`Invalid file type for ${file.fieldname}.`), {status: 400}));
+    }
+    callback(null, true);
+  }
+}).fields([
+  {name: 'ipa', maxCount: 1}, {name: 'p12', maxCount: 1}, {name: 'mobileprovision', maxCount: 1},
+  {name: 'icon', maxCount: 1}, {name: 'deb', maxCount: 1}, {name: 'dylib', maxCount: 1}
+]);
 
 await fsp.mkdir(WORK_ROOT, {recursive: true});
 await fsp.mkdir(MANIFEST_ROOT, {recursive: true, mode: 0o700});
@@ -63,7 +115,6 @@ let s3Client;
 // Hot manifest cache: polling must not download manifest.json from object storage on every browser poll.
 // S3-compatible storage is durable; cached metadata is only process memory.
 const manifestCache = new Map();
-const captchaPasses = new Map();
 const OWNER_IP = process.env.XSIGNER_OWNER_IP || '168.91.23.165';
 function normalizedClientIp(req) { return String(req.ip || req.socket?.remoteAddress || '').replace(/^::ffff:/i, '').split('%')[0]; }
 function isOwnerRequest(req) { return normalizedClientIp(req) === OWNER_IP; }
@@ -229,6 +280,26 @@ async function removeObject(key) {
   try { await getS3().send(new DeleteObjectCommand({Bucket: BUCKET, Key: key})); }
   catch (error) { console.warn('object cleanup failed:', messageOf(error)); }
 }
+async function expireSignedResultIfNeeded(manifest) {
+  if (!manifest || manifest.status !== 'completed' || !manifest.resultKey) return Boolean(manifest?.resultDeletedAt);
+  const completedAt = Number(manifest.completedAt || manifest.updatedAt || 0);
+  const expiresAt = Number(manifest.resultExpiresAt || (completedAt + SIGNED_IPA_RETENTION_MS));
+  if (!expiresAt || Date.now() < expiresAt) return false;
+  const expiredKey = manifest.resultKey;
+  try {
+    // Tigris supports the S3 DeleteObject operation. Only mark the result deleted after the API succeeds.
+    await getS3().send(new DeleteObjectCommand({Bucket: BUCKET, Key: expiredKey}));
+  } catch (error) {
+    console.warn('signed IPA expiry deletion failed:', messageOf(error));
+    return false;
+  }
+  manifest.resultKey = null;
+  manifest.resultDeletedAt = Date.now();
+  manifest.resultExpiresAt = expiresAt;
+  appendJobLog(manifest, 'The signed IPA was automatically deleted from Tigris after 10 minutes.', 'system');
+  await flushManifest(manifest).catch(error => console.warn('could not persist signed IPA expiry:', messageOf(error)));
+  return true;
+}
 async function cleanupInputs(manifest, abortOpen = true) {
   const client = getS3();
   for (const upload of Object.values(manifest.uploads || {})) {
@@ -253,12 +324,6 @@ async function verifyGoogleCaptcha(captchaToken, req) {
     console.warn('reCAPTCHA rejected a signing request:', JSON.stringify({success: captcha.success === true, hostname: captcha.hostname || null, errors: captcha['error-codes'] || []}));
     throw Object.assign(new Error('reCAPTCHA verification failed or expired. Complete the checkbox again and retry.'), {status: 403});
   }
-}
-function consumeCaptchaPass(pass, req) {
-  if (typeof pass !== 'string' || !pass) return false;
-  const entry = captchaPasses.get(pass);
-  captchaPasses.delete(pass);
-  return Boolean(entry && entry.expiresAt >= Date.now() && entry.ip === normalizedClientIp(req));
 }
 function isPrivateAddress(address) {
   const family = net.isIP(address);
@@ -335,23 +400,6 @@ async function downloadRemoteToFile(rawUrl, destination, maxBytes, onProgress = 
   }
   throw new Error('Remote file URL could not be fetched.');
 }
-const captchaLimiter = rateLimit({windowMs: 60_000, limit: 12, standardHeaders: 'draft-8', legacyHeaders: false, message: {error: 'Too many CAPTCHA verification attempts. Try again shortly.'}});
-app.post('/api/captcha/verify', captchaLimiter, async (req, res) => {
-  const token = typeof req.body?.captchaToken === 'string' ? req.body.captchaToken.trim() : '';
-  if (!token) return res.status(400).json({error: 'Complete reCAPTCHA before continuing.'});
-  try {
-    await verifyGoogleCaptcha(token, req);
-    const captchaPass = crypto.randomBytes(32).toString('base64url');
-    const now = Date.now();
-    for (const [key, value] of captchaPasses) if (value.expiresAt < now) captchaPasses.delete(key);
-    captchaPasses.set(captchaPass, {ip: normalizedClientIp(req), expiresAt: now + 30 * 60 * 1000});
-    res.set('Cache-Control', 'no-store').json({ok: true, captchaPass, expiresInSeconds: 1800});
-  } catch (error) {
-    console.error('reCAPTCHA preflight failed:', messageOf(error));
-    res.status(error.status || 503).json({error: error.status ? messageOf(error) : 'Google reCAPTCHA verification is temporarily unavailable. Please retry.'});
-  }
-});
-
 app.get('/health', (_req, res) => res.status(200).json({
   ok: true,
   service: 'xsigner',
@@ -363,7 +411,7 @@ app.get('/health', (_req, res) => res.status(200).json({
   recaptchaConfigured: Boolean(RECAPTCHA_SECRET_KEY),
   diskPath: ROOT
 }));
-app.get('/api/config', (req, res) => res.json({
+app.get('/api/config', (req, res) => res.set('Cache-Control', 'private, no-store').json({
   maxIpaBytes: MAX_IPA_BYTES,
   maxSmallFileBytes: MAX_SMALL_FILE_BYTES,
   partSizeBytes: PART_SIZE,
@@ -375,18 +423,39 @@ app.get('/api/config', (req, res) => res.json({
 app.get('/api/owner/discord-api-docs', (req, res) => {
   if (!isOwnerRequest(req)) return res.status(404).json({error: 'Not found.'});
   const origin = (PUBLIC_ORIGIN || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '');
-  res.set('Cache-Control', 'no-store').json({
-    title: 'Discord bot signing API', endpoint: `${origin}/sign`, method: 'POST', auth: 'No API key required. Requests are rate-limited per source IP and remote URLs are restricted to public HTTPS hosts.',
+  const example = [
+    `curl -X POST \\`,
+    `  -F 'ipaUrl=https://files.example.com/app.ipa' \\`,
+    `  -F 'p12=@certificate.p12' \\`,
+    `  -F 'mobileprovision=@profile.mobileprovision' \\`,
+    `  -F 'password=YOUR_P12_PASSWORD' \\`,
+    `  -F 'appName=Example App' \\`,
+    `  -F 'bundleId=com.example.app' \\`,
+    `  -F 'bundleVersion=1.0' \\`,
+    `  -F 'icon=@icon.png' \\`,
+    `  -F 'deb=@tweak.deb' \\`,
+    `  -F 'dylib=@tweak.dylib' \\`,
+    `  '${origin}/sign'`
+  ].join('\n');
+  res.set('Cache-Control', 'private, no-store').json({
+    title: 'Discord bot signing API', endpoint: `${origin}/sign`, method: 'POST',
+    contentType: 'multipart/form-data',
+    auth: 'No API key and no owner-IP restriction on /sign. The endpoint is public and rate-limited per source IP. Only ipaUrl can be a URL; all signing assets are uploaded as files.',
     fields: [
-      {name:'ipaUrl',type:'string',required:true,description:'Public HTTPS URL for the source .ipa file.'},
-      {name:'p12Url',type:'string',required:true,description:'Public HTTPS URL for the .p12/.pfx certificate.'},
-      {name:'mobileprovisionUrl',type:'string',required:true,description:'Public HTTPS URL for the .mobileprovision file.'},
-      {name:'password',type:'string',required:false,description:'P12 password; omit or use an empty string if unencrypted.'},
-      {name:'bundleId',type:'string',required:false,description:'Optional bundle ID override.'},
-      {name:'bundleName',type:'string',required:false,description:'Optional display name override.'},
-      {name:'bundleVersion',type:'string',required:false,description:'Optional version override.'}
+      {name:'ipa',type:'file',required:'Required unless ipaUrl is supplied',description:'Source .ipa file. Upload this file or use ipaUrl, but not both.'},
+      {name:'ipaUrl',type:'HTTPS URL',required:'Optional alternative to ipa file',description:'Public HTTPS URL for the source IPA. This is the only URL field accepted by /sign.'},
+      {name:'p12',type:'file',required:true,description:'Signing certificate file (.p12 or .pfx). This is a file upload, not a URL.'},
+      {name:'mobileprovision',type:'file',required:true,description:'Apple mobileprovision profile file. This is a file upload, not a URL.'},
+      {name:'password',type:'text',required:false,description:'P12 password; omit or use an empty string if unencrypted.'},
+      {name:'icon',type:'file',required:false,description:'Optional PNG icon file applied during signing.'},
+      {name:'deb',type:'file',required:false,description:'Optional .deb tweak package; contained .dylib files are extracted and injected.'},
+      {name:'dylib',type:'file',required:false,description:'Optional .dylib file to inject and re-sign. May be supplied alongside deb.'},
+      {name:'appName',type:'text',required:false,description:'Optional display-name override (also accepted as bundleName).'},
+      {name:'bundleId',type:'text',required:false,description:'Optional bundle ID override.'},
+      {name:'bundleVersion',type:'text',required:false,description:'Optional version override.'},
+      {name:'injectExtensions',type:'boolean',required:false,description:'Set to true to also inject tweaks into app extensions.'}
     ],
-    example: JSON.stringify({ipaUrl:'https://files.example.com/app.ipa',p12Url:'https://files.example.com/certificate.p12',mobileprovisionUrl:'https://files.example.com/profile.mobileprovision',password:'',bundleId:'com.example.app',bundleName:'Example App',bundleVersion:'1.0'},null,2),
+    example,
     response: JSON.stringify({ok:true,jobId:'<job-uuid>',jobToken:'<bearer-token>',status:'queued',statusUrl:'/api/jobs/<job-uuid>?after=0',downloadUrlEndpoint:'/api/jobs/<job-uuid>/download-url',otaUrlEndpoint:'/api/jobs/<job-uuid>/ota-url'},null,2),
     polling: `curl -H "Authorization: Bearer JOB_TOKEN" "${origin}/api/jobs/JOB_ID?after=0"`,
     download: `curl -X POST -H "Authorization: Bearer JOB_TOKEN" -H "Content-Type: application/json" -d '{}' "${origin}/api/jobs/JOB_ID/download-url"`,
@@ -399,7 +468,15 @@ app.post('/api/jobs', createLimiter, async (req, res) => {
   if (!JOB_ENCRYPTION_KEY) return res.status(503).json({error: 'The job encryption key is not configured in Render.'});
   const provided = req.body?.files;
   if (!provided || typeof provided !== 'object') return res.status(400).json({error: 'File metadata is required.'});
-  const captchaPass = typeof req.body?.captchaPass === 'string' ? req.body.captchaPass : '';
+  const captchaToken = typeof req.body?.captchaToken === 'string' ? req.body.captchaToken.trim() : '';
+  if (!captchaToken) return res.status(400).json({error: 'Complete reCAPTCHA before uploading files.'});
+  try {
+    // Verify Google's single-use token immediately before creating this job. This avoids
+    // a separate in-memory pass that could be lost on restarts or fail on proxy-IP normalization.
+    await verifyGoogleCaptcha(captchaToken, req);
+  } catch (error) {
+    return res.status(error.status || 503).json({error: error.status ? messageOf(error) : 'Google reCAPTCHA is temporarily unavailable. Please retry.'});
+  }
   const ipaUrlRaw = clampText(req.body?.ipaUrl || req.body?.ipa_url || req.body?.urls?.ipa, 4096);
   let remoteIpaUrl = '';
   if (ipaUrlRaw) { try { remoteIpaUrl = await validatePublicHttpsUrl(ipaUrlRaw); } catch (error) { return res.status(400).json({error: `Invalid IPA URL: ${messageOf(error)}`}); } }
@@ -432,7 +509,6 @@ app.post('/api/jobs', createLimiter, async (req, res) => {
     if (!validExt) return res.status(400).json({error: `Invalid ${kind} file type.`});
     normalized[kind] = {name, size, contentType: clampText(item.type, 120) || 'application/octet-stream'};
   }
-  if (!consumeCaptchaPass(captchaPass, req)) return res.status(403).json({error: 'Complete reCAPTCHA before uploading files. The verification pass is expired or already used.'});
   const id = newId();
   const token = crypto.randomBytes(32).toString('base64url');
   const manifest = {
@@ -543,7 +619,7 @@ app.post('/api/jobs/:id/sign', actionLimiter, async (req, res) => {
     return res.status(409).json({error: 'Upload the IPA, P12, and mobileprovision before signing.'});
   }
   // Website requests must pass server-verified CAPTCHA before any upload begins.
-  // /sign is a separately rate-limited public bot endpoint and queues its own URL-only jobs.
+  // /sign is a separately rate-limited public bot endpoint; it accepts uploaded assets and an optional IPA URL.
   if (manifest.source !== 'api' && !manifest.captchaVerifiedAt) return res.status(403).json({error: 'Complete reCAPTCHA before signing.'});
   const password = typeof req.body?.password === 'string' ? req.body.password : '';
   if (password.length > 2048) return res.status(400).json({error: 'P12 password is too long.'});
@@ -567,51 +643,108 @@ app.post('/api/jobs/:id/sign', actionLimiter, async (req, res) => {
 });
 
 const publicSignLimiter = rateLimit({windowMs: 15 * 60_000, limit: 6, standardHeaders: 'draft-8', legacyHeaders: false, message: {error: 'Too many public signing requests from this IP. Retry later.'}});
-app.post('/sign', publicSignLimiter, async (req, res) => {
-  if (!storageConfigured()) return res.status(503).json({error: 'Tigris storage is not configured.'});
-  if (!JOB_ENCRYPTION_KEY) return res.status(503).json({error: 'Signing job encryption is not configured.'});
+app.post('/sign', publicSignLimiter, apiSignUpload, async (req, res) => {
   const body = req.body || {};
-  const rawUrls = {
-    ipa: clampText(body.ipaUrl || body.ipa_url, 4096),
-    certificate: clampText(body.p12Url || body.p12_url || body.certificateUrl, 4096),
-    profile: clampText(body.mobileprovisionUrl || body.mobileprovision_url || body.profileUrl || body.profile_url, 4096)
-  };
-  if (!rawUrls.ipa || !rawUrls.certificate || !rawUrls.profile) return res.status(400).json({error: 'Provide ipaUrl, p12Url, and mobileprovisionUrl as public HTTPS URLs.'});
-  const urls = {};
-  try { for (const kind of Object.keys(rawUrls)) urls[kind] = await validatePublicHttpsUrl(rawUrls[kind]); }
-  catch (error) { return res.status(400).json({error: `Invalid source URL: ${messageOf(error)}`}); }
-  const password = typeof body.password === 'string' ? body.password : '';
-  if (password.length > 2048) return res.status(400).json({error: 'P12 password is too long.'});
-  const bundleId = clampText(body.bundleId || body.bundle_id, 200);
-  if (bundleId && !/^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/.test(bundleId)) return res.status(400).json({error: 'Bundle ID format is invalid.'});
-  const bundleName = clampText(body.bundleName || body.bundle_name, 200);
-  const bundleVersion = clampText(body.bundleVersion || body.bundle_version, 100);
-  if (bundleVersion && !/^[A-Za-z0-9._+-]+$/.test(bundleVersion)) return res.status(400).json({error: 'Version format is invalid.'});
-  const id = newId();
-  const token = crypto.randomBytes(32).toString('base64url');
-  const manifest = {
-    id, tokenHash: hashToken(token).toString('hex'), source: 'api', status: 'queued', phase: 'queued', progress: 64,
-    createdAt: Date.now(), updatedAt: Date.now(),
-    uploads: {
-      ipa: makeRemoteUpload('ipa', urls.ipa, clampText(body.ipaName || body.ipa_name, 240)),
-      certificate: makeRemoteUpload('certificate', urls.certificate, clampText(body.p12Name || body.certificateName, 240)),
-      profile: makeRemoteUpload('profile', urls.profile, clampText(body.mobileprovisionName || body.profileName, 240))
-    },
-    settings: {bundleId, bundleName, bundleVersion, injectExtensions: body.injectExtensions === true},
-    passwordCipher: encryptPassword(password), resultKey: null, resultSize: null, error: null,
-    logs: [], logSequence: 0, otaTokenHash: null, otaExpiresAt: null, otaMetadata: null
-  };
+  const files = req.files || {};
+  const file = field => Array.isArray(files[field]) ? files[field][0] : null;
+  const ipaFile = file('ipa');
+  const p12File = file('p12');
+  const profileFile = file('mobileprovision');
+  const iconFile = file('icon');
+  const debFile = file('deb');
+  const dylibFile = file('dylib');
+  const localApiFiles = [ipaFile, p12File, profileFile, iconFile, debFile, dylibFile].filter(Boolean);
+  let manifest = null;
+  let password = '';
+
   try {
-    manifestCache.set(id, manifest);
-    appendJobLog(manifest, 'API signing request accepted. No API key is required; per-IP rate limiting is enabled.', 'system', password);
+    if (!storageConfigured()) return res.status(503).json({error: 'Tigris storage is not configured.'});
+    if (!JOB_ENCRYPTION_KEY) return res.status(503).json({error: 'Signing job encryption is not configured.'});
+
+    const rawIpaUrl = clampText(body.ipaUrl, 4096);
+    // ipaUrl is the only URL accepted for source material. Certificates and profiles must be uploaded files.
+    if (body.p12Url || body.p12_url || body.certificateUrl || body.mobileprovisionUrl || body.mobileprovision_url || body.profileUrl || body.profile_url) {
+      return res.status(400).json({error: 'Only ipaUrl may be provided as a URL. Upload p12 and mobileprovision as files.'});
+    }
+    if (ipaFile && rawIpaUrl) return res.status(400).json({error: 'Provide either the ipa file or ipaUrl, not both.'});
+    if (!ipaFile && !rawIpaUrl) return res.status(400).json({error: 'Provide an ipa file or ipaUrl.'});
+    if (!p12File || !profileFile) return res.status(400).json({error: 'Upload required files using the p12 and mobileprovision fields.'});
+
+    let ipaUrl = '';
+    if (rawIpaUrl) {
+      try { ipaUrl = await validatePublicHttpsUrl(rawIpaUrl); }
+      catch (error) { throw Object.assign(new Error(`Invalid IPA URL: ${messageOf(error)}`, {cause: error}), {status: 400}); }
+    }
+    password = typeof body.password === 'string' ? body.password : '';
+    if (password.length > 2048) return res.status(400).json({error: 'P12 password is too long.'});
+    const bundleId = clampText(body.bundleId || body.bundle_id, 200);
+    if (bundleId && !/^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/.test(bundleId)) return res.status(400).json({error: 'Bundle ID format is invalid.'});
+    const bundleName = clampText(body.appName || body.app_name || body.bundleName || body.bundle_name, 200);
+    const bundleVersion = clampText(body.bundleVersion || body.bundle_version || body.version, 100);
+    if (bundleVersion && !/^[A-Za-z0-9._+-]+$/.test(bundleVersion)) return res.status(400).json({error: 'Version format is invalid.'});
+    const injectExtensions = body.injectExtensions === true || ['true', '1', 'yes'].includes(String(body.injectExtensions || '').trim().toLowerCase());
+
+    const id = newId();
+    const token = crypto.randomBytes(32).toString('base64url');
+    manifest = {
+      id, tokenHash: hashToken(token).toString('hex'), source: 'api', status: 'creating_uploads', phase: 'preparing', progress: 0,
+      createdAt: Date.now(), updatedAt: Date.now(), uploads: {},
+      settings: {bundleId, bundleName, bundleVersion, injectExtensions},
+      passwordCipher: encryptPassword(password), resultKey: null, resultSize: null, resultExpiresAt: null,
+      error: null, logs: [], logSequence: 0, otaTokenHash: null, otaExpiresAt: null, otaMetadata: null
+    };
+
+    if (ipaUrl) {
+      manifest.uploads.ipa = makeRemoteUpload('ipa', ipaUrl);
+      appendJobLog(manifest, 'API request accepted. IPA will be fetched from the supplied public HTTPS URL.', 'system', password);
+    }
+    const uploadMap = [
+      ['p12', 'certificate'], ['mobileprovision', 'profile'], ['icon', 'icon'], ['deb', 'deb'], ['dylib', 'dylib'],
+      ...(!ipaUrl && ipaFile ? [['ipa', 'ipa']] : [])
+    ];
+    for (const [fieldName, kind] of uploadMap) {
+      const source = file(fieldName);
+      if (!source) continue;
+      const extension = path.extname(source.originalname).toLowerCase();
+      const key = `uploads/${id}/${kind}${extension}`;
+      const contentType = source.mimetype || 'application/octet-stream';
+      appendJobLog(manifest, `Uploading API ${kind} file to private Tigris storage (${formatBytesSafe(source.size)}).`, 'system', password);
+      const uploader = new Upload({
+        client: getS3(),
+        params: {
+          Bucket: BUCKET, Key: key, Body: fs.createReadStream(source.path), ContentLength: source.size,
+          ContentType: contentType, Metadata: {jobid: id, kind, source: 'discord-api'}
+        },
+        queueSize: 2, partSize: Math.max(64 * 1024 * 1024, PART_SIZE), leavePartsOnError: false
+      });
+      await uploader.done();
+      manifest.uploads[kind] = {
+        key, uploadId: null, filename: path.basename(source.originalname).slice(0, 240),
+        contentType, expectedSize: source.size, partCount: 0, completed: true, actualSize: source.size, remote: false
+      };
+    }
+    if (!manifest.uploads.ipa) throw Object.assign(new Error('The IPA source was not provided.'), {status: 400});
+    if (!manifest.uploads.certificate || !manifest.uploads.profile) throw Object.assign(new Error('The P12 and mobileprovision files must both be uploaded.'), {status: 400});
+    manifest.status = 'queued'; manifest.phase = 'queued'; manifest.progress = 64;
+    manifestCache.set(manifest.id, manifest);
+    appendJobLog(manifest, 'Discord API signing request accepted. No API key or IP allowlist is required; requests are rate-limited per IP.', 'system', password);
     await flushManifest(manifest);
-    enqueue(id);
+    enqueue(manifest.id);
     const origin = (PUBLIC_ORIGIN || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '');
-    res.status(202).set('Cache-Control', 'no-store').json({ok: true, jobId: id, jobToken: token, status: 'queued', statusUrl: `${origin}/api/jobs/${id}?after=0`, downloadUrlEndpoint: `${origin}/api/jobs/${id}/download-url`, otaUrlEndpoint: `${origin}/api/jobs/${id}/ota-url`});
+    return res.status(202).set('Cache-Control', 'no-store').json({ok: true, jobId: manifest.id, jobToken: token, status: 'queued', statusUrl: `${origin}/api/jobs/${manifest.id}?after=0`, downloadUrlEndpoint: `${origin}/api/jobs/${manifest.id}/download-url`, otaUrlEndpoint: `${origin}/api/jobs/${manifest.id}/ota-url`});
   } catch (error) {
     console.error('public /sign request failed:', messageOf(error));
-    manifest.passwordCipher = null;
-    res.status(503).json({error: 'Could not queue the signing request. Check object storage and encryption configuration.'});
+    if (manifest) {
+      for (const upload of Object.values(manifest.uploads || {})) if (upload?.key) await removeObject(upload.key);
+      if (manifest.resultKey) await removeObject(manifest.resultKey);
+      manifest.passwordCipher = null;
+      await fsp.rm(localManifestPath(manifest.id), {force: true}).catch(() => {});
+      manifestCache.delete(manifest.id);
+    }
+    if (!res.headersSent) return res.status(error?.status || 503).json({error: error?.status ? messageOf(error) : 'Could not queue the signing request. Check object storage and encryption configuration.'});
+  } finally {
+    password = '';
+    await Promise.all(localApiFiles.map(source => fsp.rm(source.path, {force: true}).catch(() => {})));
   }
 });
 
@@ -632,14 +765,19 @@ app.get('/api/jobs/:id', pollLimiter, async (req, res) => {
 app.post('/api/jobs/:id/download-url', actionLimiter, async (req, res) => {
   const manifest = await authorizedJob(req, res, req.params.id);
   if (!manifest) return;
-  if (manifest.status !== 'completed' || !manifest.resultKey) return res.status(409).json({error: 'Signed IPA is not ready yet.'});
+  if (manifest.status !== 'completed') return res.status(409).json({error: 'Signed IPA is not ready yet.'});
+  await expireSignedResultIfNeeded(manifest);
+  if (!manifest.resultKey) return res.status(410).json({error: 'This signed IPA expired and was deleted after 10 minutes. Sign the app again to create a new download.'});
+  const remainingSeconds = Math.floor((Number(manifest.resultExpiresAt || (Number(manifest.completedAt || Date.now()) + SIGNED_IPA_RETENTION_MS)) - Date.now()) / 1000);
+  if (remainingSeconds < 1) return res.status(410).json({error: 'This signed IPA has expired. Sign the app again to create a new download.'});
+  const expiresIn = Math.max(1, Math.min(600, remainingSeconds));
   try {
     const url = await getSignedUrl(getS3(), new GetObjectCommand({
       Bucket: BUCKET, Key: manifest.resultKey,
       ResponseContentDisposition: 'attachment; filename="signed.ipa"',
       ResponseContentType: 'application/octet-stream'
-    }), {expiresIn: 3600});
-    res.set('Cache-Control', 'no-store').json({url, expiresIn: 3600});
+    }), {expiresIn});
+    res.set('Cache-Control', 'no-store').json({url, expiresIn});
   } catch (error) {
     console.error('download presign failed:', messageOf(error));
     res.status(503).json({error: 'Could not create the download link. Check object storage configuration and try again shortly.'});
@@ -649,13 +787,16 @@ app.post('/api/jobs/:id/download-url', actionLimiter, async (req, res) => {
 app.post('/api/jobs/:id/ota-url', actionLimiter, async (req, res) => {
   const manifest = await authorizedJob(req, res, req.params.id);
   if (!manifest) return;
-  if (manifest.status !== 'completed' || !manifest.resultKey) return res.status(409).json({error: 'Signed IPA is not ready for OTA installation.'});
+  if (manifest.status !== 'completed') return res.status(409).json({error: 'Signed IPA is not ready for OTA installation.'});
+  await expireSignedResultIfNeeded(manifest);
+  if (!manifest.resultKey) return res.status(410).json({error: 'This signed IPA expired and was deleted after 10 minutes. Sign the app again for a new OTA link.'});
   const metadata = manifest.otaMetadata || {};
   if (!metadata.bundleId) return res.status(409).json({error: 'Could not determine the app Bundle ID. Add a Bundle ID in Advanced options and sign again to enable OTA installation.'});
   try {
     const installToken = crypto.randomBytes(32).toString('base64url');
     manifest.otaTokenHash = hashToken(installToken).toString('hex');
-    manifest.otaExpiresAt = Date.now() + 24 * 60 * 60 * 1000;
+    const resultExpiresAt = Number(manifest.resultExpiresAt || (Number(manifest.completedAt || Date.now()) + SIGNED_IPA_RETENTION_MS));
+    manifest.otaExpiresAt = Math.min(Date.now() + 24 * 60 * 60 * 1000, resultExpiresAt);
     await putManifest(manifest);
     const baseOrigin = (PUBLIC_ORIGIN || 'https://xsigner.onrender.com').replace(/\/+$/, '');
     const manifestUrl = `${baseOrigin}/ota/${manifest.id}/${installToken}/manifest.plist`;
@@ -679,9 +820,13 @@ app.get('/ota/:id/:token/manifest.plist', async (req, res) => {
     if (!manifest || manifest.status !== 'completed' || !manifest.resultKey || !manifest.otaTokenHash || !tokenMatches(token, manifest.otaTokenHash) || Date.now() > Number(manifest.otaExpiresAt || 0)) {
       return res.status(404).type('text').send('Installation link expired or unavailable');
     }
+    await expireSignedResultIfNeeded(manifest);
+    if (!manifest.resultKey) return res.status(404).type('text').send('Signed IPA expired and was deleted');
     const metadata = manifest.otaMetadata || {};
     if (!metadata.bundleId) return res.status(409).type('text').send('The signed app is missing its Bundle ID.');
-    const ipaUrl = await getSignedUrl(getS3(), new GetObjectCommand({Bucket: BUCKET, Key: manifest.resultKey, ResponseContentType: 'application/octet-stream'}), {expiresIn: 4 * 60 * 60});
+    const remainingSeconds = Math.floor((Number(manifest.resultExpiresAt || (Number(manifest.completedAt || Date.now()) + SIGNED_IPA_RETENTION_MS)) - Date.now()) / 1000);
+    if (remainingSeconds < 1) return res.status(404).type('text').send('Signed IPA expired and was deleted');
+    const ipaUrl = await getSignedUrl(getS3(), new GetObjectCommand({Bucket: BUCKET, Key: manifest.resultKey, ResponseContentType: 'application/octet-stream'}), {expiresIn: Math.max(1, Math.min(600, remainingSeconds))});
     const escapeXml = value => String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;').replace(/'/g, '&apos;');
     const title = escapeXml(metadata.appName || 'Signed app');
     const bundleId = escapeXml(metadata.bundleId);
@@ -976,13 +1121,43 @@ async function runSigningJob(id) {
     if (local.icon) args.push('-I', local.icon);
     if (manifest.settings?.injectExtensions && dylibsToInject.length) args.push('-P');
     for (const dylibPath of dylibsToInject) args.push('-l', dylibPath);
-    const result = await spawnSigner(args, workDir, password, (line, stream) => {
-      const clean = safeTerminalLine(line, password);
-      if (!clean) return;
-      appendJobLog(manifest, clean, stream, password);
-      updateProgressFromZsignLine(manifest, clean);
-      scheduleManifestFlush(manifest);
-    });
+    let archiveHeartbeat = null;
+    let archivingActive = false;
+    const stopArchiveHeartbeat = () => {
+      if (archiveHeartbeat) clearInterval(archiveHeartbeat);
+      archiveHeartbeat = null;
+      archivingActive = false;
+    };
+    let result;
+    try {
+      result = await spawnSigner(args, workDir, password, (line, stream) => {
+        const clean = safeTerminalLine(line, password);
+        if (!clean) return;
+        const lower = clean.toLowerCase();
+        if (lower.includes('>>> archiving:') && !archivingActive) {
+          archivingActive = true;
+          manifest.phase = 'archiving';
+          manifest.progress = Math.max(Number(manifest.progress || 0), 88);
+          appendJobLog(manifest, 'Archiving the signed IPA: writing the final package. Large apps may take a while; zsign is still working.', 'system', password);
+          archiveHeartbeat = setInterval(() => {
+            if (manifest.phase !== 'archiving') return stopArchiveHeartbeat();
+            appendJobLog(manifest, 'Still archiving the IPA. The final archive is being written; this step can take several minutes for large apps.', 'system', password);
+            manifest.progress = Math.min(90, Math.max(88, Number(manifest.progress || 0) + 1));
+            scheduleManifestFlush(manifest);
+          }, 10_000);
+          archiveHeartbeat.unref?.();
+        }
+        appendJobLog(manifest, clean, stream, password);
+        updateProgressFromZsignLine(manifest, clean);
+        if (lower.includes('>>> archive ok!') || lower.includes('>>> done.')) {
+          stopArchiveHeartbeat();
+          if (manifest.phase === 'archiving') manifest.phase = 'signing';
+        }
+        scheduleManifestFlush(manifest);
+      });
+    } finally {
+      stopArchiveHeartbeat();
+    }
     await flushManifest(manifest);
     if (result.timedOut) throw new Error('Signing exceeded the configured time limit. Try a smaller IPA or increase SIGN_TIMEOUT_MS.');
     const outputStat = await fsp.stat(output).catch(() => null);
@@ -1022,10 +1197,12 @@ async function runSigningJob(id) {
     await uploader.done();
     await flushManifest(manifest);
     manifest.resultSize = outputStat.size;
+    manifest.completedAt = Date.now();
+    manifest.resultExpiresAt = manifest.completedAt + SIGNED_IPA_RETENTION_MS;
     await cleanupInputs(manifest, false);
     manifest.passwordCipher = null;
     manifest.status = 'completed'; manifest.phase = 'completed'; manifest.progress = 100;
-    manifest.completedAt = Date.now(); manifest.error = null;
+    manifest.error = null;
     appendJobLog(manifest, 'Result uploaded. Temporary source files and certificate material will now be removed.', 'system', password);
     password = '';
     await flushManifest(manifest);
@@ -1073,6 +1250,22 @@ async function recoverJobs({recoverInterruptedImmediately = false} = {}) {
     console.warn('queue recovery unavailable:', messageOf(error));
   }
 }
+async function cleanupExpiredSignedResults() {
+  if (!storageConfigured()) return;
+  try {
+    const entries = await fsp.readdir(MANIFEST_ROOT, {withFileTypes: true});
+    for (const entry of entries) {
+      if (!entry.isFile() || !/^[0-9a-f-]{36}\.json$/i.test(entry.name)) continue;
+      const id = entry.name.slice(0, -5);
+      const manifest = await maybeManifest(id);
+      if (!manifest || manifest.status !== 'completed' || !manifest.resultKey) continue;
+      await expireSignedResultIfNeeded(manifest);
+    }
+  } catch (error) {
+    console.warn('signed IPA retention sweep failed:', messageOf(error));
+  }
+}
+
 async function cleanupExpiredJobs() {
   if (!storageConfigured()) return;
   try {
@@ -1191,8 +1384,9 @@ app.post('/api/certchecker/checkCert', actionLimiter, (req, res, next) => {
 app.use((error, _req, res, _next) => {
   console.error('request failed:', messageOf(error));
   if (res.headersSent) return;
-  if (error?.code === 'LIMIT_FILE_SIZE' || error?.code === 'LIMIT_FILE_COUNT') return res.status(413).json({error: 'Uploaded files exceed the certificate checker limits.'});
-  if (error?.name === 'MulterError') return res.status(400).json({error: 'Invalid certificate checker form upload.'});
+  if (error?.status) return res.status(error.status).json({error: messageOf(error)});
+  if (error?.code === 'LIMIT_FILE_SIZE' || error?.code === 'LIMIT_FILE_COUNT') return res.status(413).json({error: 'Uploaded files exceed the configured upload limit.'});
+  if (error?.name === 'MulterError') return res.status(400).json({error: 'Invalid multipart file upload.'});
   res.status(500).json({error: 'Unexpected server error.'});
 });
 
@@ -1203,9 +1397,12 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 });
 const maintenanceIntervalMs = Number(process.env.S3_MAINTENANCE_INTERVAL_MS || 0);
 const maintenanceTimer = maintenanceIntervalMs >= 60 * 60_000 ? setInterval(() => { void recoverJobs(); void cleanupExpiredJobs(); }, maintenanceIntervalMs).unref() : null;
+const signedResultCleanupTimer = setInterval(() => { void cleanupExpiredSignedResults(); }, SIGNED_IPA_CLEANUP_INTERVAL_MS).unref();
+void cleanupExpiredSignedResults();
 
 async function shutdown() {
   if (maintenanceTimer) clearInterval(maintenanceTimer);
+  if (signedResultCleanupTimer) clearInterval(signedResultCleanupTimer);
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(1), 25_000).unref();
 }
