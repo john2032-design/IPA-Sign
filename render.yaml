@@ -33,15 +33,21 @@ services:
         value: "2700000"
       - key: PUBLIC_ORIGIN
         value: https://xsigner.onrender.com
-      - key: B2_ENDPOINT
-        value: https://s3.ca-east-006.backblazeb2.com
-      - key: B2_REGION
-        value: ca-east-006
-      - key: B2_BUCKET
+      - key: AWS_ENDPOINT_URL_S3
+        value: https://t3.storage.dev
+      - key: AWS_ENDPOINT_URL_IAM
+        value: https://iam.storage.dev
+      - key: AWS_REGION
+        value: auto
+      - key: S3_BUCKET
         value: xsigner
-      - key: B2_KEY_ID
+      - key: MANIFEST_STORAGE
+        value: local
+      - key: S3_MAINTENANCE_INTERVAL_MS
+        value: "3600000"
+      - key: AWS_ACCESS_KEY_ID
         sync: false
-      - key: B2_APPLICATION_KEY
+      - key: AWS_SECRET_ACCESS_KEY
         sync: false
       - key: JOB_ENCRYPTION_KEY
         generateValue: true

@@ -6,15 +6,17 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
+import dns from 'node:dns/promises';
+import net from 'node:net';
 import {spawn, execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import multer from 'multer';
 import {pipeline} from 'node:stream/promises';
-import {Transform} from 'node:stream';
+import {Transform, Readable} from 'node:stream';
 import {
   S3Client, CreateMultipartUploadCommand, UploadPartCommand,
   CompleteMultipartUploadCommand, AbortMultipartUploadCommand,
-  PutObjectCommand, GetObjectCommand, HeadObjectCommand,
+  PutObjectCommand, GetObjectCommand,
   DeleteObjectCommand, ListObjectsV2Command
 } from '@aws-sdk/client-s3';
 import {getSignedUrl} from '@aws-sdk/s3-request-presigner';
@@ -25,10 +27,11 @@ app.set('trust proxy', 1);
 const PORT = Number(process.env.PORT || 10000);
 const ROOT = process.env.DATA_DIR || '/tmp/xsigner-data';
 const WORK_ROOT = path.join(ROOT, 'work');
+const MANIFEST_ROOT = path.join(ROOT, 'manifests');
 const SIGNER = process.env.ZSIGN_BIN || '/usr/local/bin/zsign';
-const BUCKET = process.env.B2_BUCKET || '';
-const REGION = process.env.B2_REGION || 'ca-east-006';
-const ENDPOINT = process.env.B2_ENDPOINT || `https://s3.${REGION}.backblazeb2.com`;
+const BUCKET = process.env.S3_BUCKET || process.env.TIGRIS_BUCKET || '';
+const REGION = process.env.AWS_REGION || 'auto';
+const ENDPOINT = process.env.AWS_ENDPOINT_URL_S3 || process.env.AWS_ENDPOINT_URL || 'https://t3.storage.dev';
 const MAX_IPA_BYTES = Number(process.env.MAX_IPA_BYTES || 4294967296);
 const MAX_SMALL_FILE_BYTES = 16 * 1024 * 1024;
 const PART_SIZE = Number(process.env.PART_SIZE_BYTES || 64 * 1024 * 1024);
@@ -44,6 +47,7 @@ const execFileAsync = promisify(execFile);
 const checkerUpload = multer({storage: multer.memoryStorage(), limits: {fileSize: 32 * 1024 * 1024, files: 2, fields: 3}}).fields([{name: 'p12', maxCount: 1}, {name: 'mobileprovision', maxCount: 1}]);
 
 await fsp.mkdir(WORK_ROOT, {recursive: true});
+await fsp.mkdir(MANIFEST_ROOT, {recursive: true, mode: 0o700});
 
 app.disable('x-powered-by');
 app.use(helmet({contentSecurityPolicy: false, crossOriginEmbedderPolicy: false}));
@@ -56,19 +60,27 @@ const actionLimiter = rateLimit({windowMs: 60_000, limit: 15, standardHeaders: '
 const pollLimiter = rateLimit({windowMs: 60_000, limit: 180, standardHeaders: 'draft-8', legacyHeaders: false, message: {error: 'Too many status requests. Slow down briefly.'}});
 
 let s3Client;
+// Hot manifest cache: polling must not download manifest.json from object storage on every browser poll.
+// S3-compatible storage is durable; cached metadata is only process memory.
+const manifestCache = new Map();
+const captchaPasses = new Map();
+const OWNER_IP = process.env.XSIGNER_OWNER_IP || '168.91.23.165';
+function normalizedClientIp(req) { return String(req.ip || req.socket?.remoteAddress || '').replace(/^::ffff:/i, '').split('%')[0]; }
+function isOwnerRequest(req) { return normalizedClientIp(req) === OWNER_IP; }
 function storageConfigured() {
-  return Boolean(BUCKET && process.env.B2_KEY_ID && process.env.B2_APPLICATION_KEY && ENDPOINT && REGION);
+  return Boolean(BUCKET && process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && ENDPOINT && REGION);
 }
 function getS3() {
-  if (!storageConfigured()) throw new Error('Backblaze B2 is not configured. Set B2_BUCKET, B2_KEY_ID, and B2_APPLICATION_KEY in Render.');
+  if (!storageConfigured()) throw new Error('Tigris storage is not configured. Set S3_BUCKET, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_ENDPOINT_URL_S3, and AWS_REGION in Render.');
   if (!s3Client) {
     s3Client = new S3Client({
       region: REGION,
       endpoint: ENDPOINT,
-      forcePathStyle: true,
+      // Tigris expects virtual-host-style bucket URLs for correctly signed requests.
+      forcePathStyle: false,
       credentials: {
-        accessKeyId: process.env.B2_KEY_ID,
-        secretAccessKey: process.env.B2_APPLICATION_KEY
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
       },
       maxAttempts: 4
     });
@@ -76,6 +88,7 @@ function getS3() {
   return s3Client;
 }
 function s3KeyForManifest(id) { return `jobs/${id}/manifest.json`; }
+function isLocalManifestStorage() { return !['s3', 'tigris'].includes(String(process.env.MANIFEST_STORAGE || '').toLowerCase()); }
 function newId() { return crypto.randomUUID(); }
 function hashToken(value) { return crypto.createHash('sha256').update(value).digest(); }
 function tokenMatches(given, expectedHex) {
@@ -102,28 +115,62 @@ function decryptPassword(data) {
 }
 function validateId(id) { return typeof id === 'string' && /^[0-9a-f-]{36}$/i.test(id); }
 function clampText(value, max) { return typeof value === 'string' ? value.trim().slice(0, max) : ''; }
+function formatBytesSafe(bytes) { const n = Math.max(0, Number(bytes) || 0); if (n < 1024) return `${n} B`; if (n < 1024 ** 2) return `${(n/1024).toFixed(1)} KB`; if (n < 1024 ** 3) return `${(n/1024**2).toFixed(1)} MB`; return `${(n/1024**3).toFixed(2)} GB`; }
 function messageOf(error) { return String(error?.message || 'Unexpected error').slice(0, 700); }
+function storageErrorForUser(_error) { return 'Object storage is temporarily unavailable. Please retry shortly.'; }
 function isManifestKey(key) { return typeof key === 'string' && key.startsWith('jobs/') && key.endsWith('/manifest.json'); }
 
+function localManifestPath(id) { return path.join(MANIFEST_ROOT, `${id}.json`); }
+async function persistManifestLocally(manifest) {
+  const target = localManifestPath(manifest.id);
+  const temporary = `${target}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  try {
+    await fsp.writeFile(temporary, JSON.stringify(manifest), {mode: 0o600, flag: 'wx'});
+    await fsp.rename(temporary, target);
+  } catch (error) {
+    await fsp.rm(temporary, {force: true}).catch(() => {});
+    throw error;
+  }
+}
 async function putManifest(manifest) {
+  // Job metadata uses Render's persistent disk by default to reduce object-storage requests.
+  // Set MANIFEST_STORAGE=s3 if you explicitly want manifests in Tigris instead.
   manifest.updatedAt = Date.now();
-  await getS3().send(new PutObjectCommand({
-    Bucket: BUCKET,
-    Key: s3KeyForManifest(manifest.id),
-    Body: JSON.stringify(manifest),
-    ContentType: 'application/json; charset=utf-8',
+  if (!isLocalManifestStorage()) await getS3().send(new PutObjectCommand({
+    Bucket: BUCKET, Key: s3KeyForManifest(manifest.id),
+    Body: JSON.stringify(manifest), ContentType: 'application/json; charset=utf-8',
     CacheControl: 'no-store'
   }));
+  await persistManifestLocally(manifest);
+  manifestCache.set(manifest.id, manifest);
+  while (manifestCache.size > 1500) manifestCache.delete(manifestCache.keys().next().value);
 }
 async function getManifest(id) {
+  const cached = manifestCache.get(id);
+  if (cached) return cached;
+  try {
+    const body = await fsp.readFile(localManifestPath(id), 'utf8');
+    const manifest = JSON.parse(body);
+    manifestCache.set(id, manifest);
+    return manifest;
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  // Fallback for jobs configured to store manifests in the S3-compatible bucket.
+  if (isLocalManifestStorage()) throw Object.assign(new Error('Job not found in local metadata store.'), {code: 'ENOENT'});
   const response = await getS3().send(new GetObjectCommand({Bucket: BUCKET, Key: s3KeyForManifest(id)}));
   const body = await response.Body.transformToString();
-  return JSON.parse(body);
+  const manifest = JSON.parse(body);
+  await persistManifestLocally(manifest);
+  manifestCache.set(id, manifest);
+  return manifest;
 }
 async function maybeManifest(id) {
+  const cached = manifestCache.get(id);
+  if (cached) return cached;
   try { return await getManifest(id); }
   catch (error) {
-    if (error?.$metadata?.httpStatusCode === 404 || error?.name === 'NoSuchKey' || error?.name === 'NotFound') return null;
+    if (error?.code === 'ENOENT' || error?.$metadata?.httpStatusCode === 404 || error?.name === 'NoSuchKey' || error?.name === 'NotFound') return null;
     throw error;
   }
 }
@@ -137,10 +184,21 @@ async function authorizedJob(req, res, id) {
       res.status(404).json({error: 'Job not found or access token invalid.'});
       return null;
     }
+    // On-demand recovery avoids a full object-storage scan at startup. This is especially
+    // useful on one-instance Render services where in-memory queue state resets.
+    if (!activeIds.has(id) && !queuedIds.has(id)) {
+      if (manifest.status === 'queued') enqueue(id);
+      else if (manifest.status === 'signing' && Date.now() - Number(manifest.updatedAt || 0) > STALE_JOB_MS) {
+        manifest.status = 'queued'; manifest.phase = 'queued'; manifest.progress = 64; manifest.error = null;
+        appendJobLog(manifest, 'Recovered an interrupted signing job after its worker stopped.', 'system');
+        await flushManifest(manifest);
+        enqueue(id);
+      }
+    }
     return manifest;
   } catch (error) {
-    console.error('manifest read failed:', messageOf(error));
-    res.status(503).json({error: 'Job storage is temporarily unavailable.'});
+    console.error('manifest read failed:', JSON.stringify({message: messageOf(error), code: error?.Code || error?.code || null, status: error?.$metadata?.httpStatusCode || null}));
+    res.status(503).json({error: storageErrorForUser(error)});
     return null;
   }
 }
@@ -151,15 +209,20 @@ async function signPartUrl(upload, partNumber) {
   }), {expiresIn: 3600});
 }
 async function listManifestKeys() {
+  // Local manifests are authoritative in local mode; do not list or download remote manifest history.
+  const entries = await fsp.readdir(MANIFEST_ROOT, {withFileTypes: true});
+  const localKeys = entries.filter(entry => entry.isFile() && /^[0-9a-f-]{36}\.json$/i.test(entry.name))
+    .map(entry => `jobs/${entry.name.slice(0, -5)}/manifest.json`);
+  if (isLocalManifestStorage() || process.env.S3_RECOVER_ON_START !== 'true') return localKeys;
+  const keys = new Set(localKeys);
   const client = getS3();
-  const keys = [];
   let token;
   do {
     const page = await client.send(new ListObjectsV2Command({Bucket: BUCKET, Prefix: 'jobs/', ContinuationToken: token, MaxKeys: 1000}));
-    for (const obj of page.Contents || []) if (isManifestKey(obj.Key)) keys.push(obj.Key);
+    for (const obj of page.Contents || []) if (isManifestKey(obj.Key)) keys.add(obj.Key);
     token = page.IsTruncated ? page.NextContinuationToken : undefined;
   } while (token);
-  return keys;
+  return [...keys];
 }
 async function removeObject(key) {
   if (!key) return;
@@ -169,7 +232,7 @@ async function removeObject(key) {
 async function cleanupInputs(manifest, abortOpen = true) {
   const client = getS3();
   for (const upload of Object.values(manifest.uploads || {})) {
-    if (!upload) continue;
+    if (!upload || !upload.key) continue;
     if (abortOpen && upload.uploadId && !upload.completed) {
       try { await client.send(new AbortMultipartUploadCommand({Bucket: BUCKET, Key: upload.key, UploadId: upload.uploadId})); }
       catch (error) { /* The multipart upload may already have expired or completed. */ }
@@ -178,6 +241,116 @@ async function cleanupInputs(manifest, abortOpen = true) {
     upload.uploadId = null;
   }
 }
+
+async function verifyGoogleCaptcha(captchaToken, req) {
+  if (!RECAPTCHA_SECRET_KEY) throw Object.assign(new Error('reCAPTCHA verification is not configured on the server. Add RECAPTCHA_SECRET_KEY in Render.'), {status: 503});
+  const verifyBody = new URLSearchParams({secret: RECAPTCHA_SECRET_KEY, response: captchaToken});
+  if (req.ip) verifyBody.set('remoteip', req.ip);
+  const captchaResponse = await fetch('https://www.google.com/recaptcha/api/siteverify', {method: 'POST', headers: {'content-type': 'application/x-www-form-urlencoded'}, body: verifyBody, signal: AbortSignal.timeout(10_000)});
+  const captcha = await captchaResponse.json();
+  const expectedHosts = (process.env.RECAPTCHA_ALLOWED_HOSTNAMES || req.hostname || 'xsigner.onrender.com').split(',').map(value => value.trim().toLowerCase()).filter(Boolean);
+  if (!captchaResponse.ok || captcha.success !== true || !expectedHosts.includes(String(captcha.hostname || '').toLowerCase())) {
+    console.warn('reCAPTCHA rejected a signing request:', JSON.stringify({success: captcha.success === true, hostname: captcha.hostname || null, errors: captcha['error-codes'] || []}));
+    throw Object.assign(new Error('reCAPTCHA verification failed or expired. Complete the checkbox again and retry.'), {status: 403});
+  }
+}
+function consumeCaptchaPass(pass, req) {
+  if (typeof pass !== 'string' || !pass) return false;
+  const entry = captchaPasses.get(pass);
+  captchaPasses.delete(pass);
+  return Boolean(entry && entry.expiresAt >= Date.now() && entry.ip === normalizedClientIp(req));
+}
+function isPrivateAddress(address) {
+  const family = net.isIP(address);
+  if (family === 4) {
+    const [a,b,c] = address.split('.').map(Number);
+    return a === 0 || a === 10 || a === 127 || a >= 224 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || (a === 192 && b === 0) || (a === 198 && (b === 18 || b === 19 || b === 51)) || (a === 203 && b === 0 && c === 113);
+  }
+  if (family === 6) {
+    const ip = address.toLowerCase();
+    return ip === '::' || ip === '::1' || ip.startsWith('fc') || ip.startsWith('fd') || /^fe[89ab]/.test(ip) || ip.startsWith('::ffff:');
+  }
+  return true;
+}
+async function validatePublicHttpsUrl(raw) {
+  let url;
+  try { url = new URL(String(raw || '').trim()); } catch { throw new Error('URL is invalid.'); }
+  if (url.protocol !== 'https:' || url.username || url.password || !url.hostname || (url.port && url.port !== '443')) throw new Error('URL must be a public HTTPS URL without embedded credentials or a non-standard port.');
+  const host = url.hostname.toLowerCase().replace(/\.$/, '');
+  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal')) throw new Error('Private or local URLs are not allowed.');
+  let addresses;
+  if (net.isIP(host)) addresses = [{address: host}];
+  else {
+    try { addresses = await dns.lookup(host, {all: true, verbatim: true}); }
+    catch { throw new Error('Could not resolve the URL hostname.'); }
+  }
+  if (!addresses.length || addresses.some(item => isPrivateAddress(item.address))) throw new Error('URL must resolve only to public IP addresses.');
+  url.hash = '';
+  return url.toString();
+}
+function remoteFilename(urlString, kind, requestedName = '') {
+  const fallback = {ipa: 'remote-app.ipa', certificate: 'certificate.p12', profile: 'profile.mobileprovision'}[kind] || `remote-${kind}`;
+  const isAllowed = name => {
+    const ext = path.extname(name).toLowerCase();
+    return (kind === 'ipa' && ext === '.ipa') || (kind === 'certificate' && ['.p12','.pfx'].includes(ext)) || (kind === 'profile' && ext === '.mobileprovision');
+  };
+  const requested = path.basename(clampText(requestedName, 240));
+  if (requested && !requested.includes('\0') && isAllowed(requested)) return requested;
+  try {
+    const url = new URL(urlString);
+    const candidate = decodeURIComponent(path.basename(url.pathname));
+    if (candidate && !candidate.includes('\0') && isAllowed(candidate)) return candidate;
+  } catch {}
+  return fallback;
+}
+function makeRemoteUpload(kind, sourceUrl, requestedName = '') {
+  const maxBytes = ({ipa: MAX_IPA_BYTES, certificate: MAX_SMALL_FILE_BYTES, profile: MAX_SMALL_FILE_BYTES})[kind];
+  return {key: null, uploadId: null, filename: remoteFilename(sourceUrl, kind, requestedName), contentType: 'application/octet-stream', expectedSize: null, partCount: 0, completed: true, actualSize: null, remote: true, sourceUrl, maxBytes};
+}
+async function downloadRemoteToFile(rawUrl, destination, maxBytes, onProgress = () => {}) {
+  let currentUrl = rawUrl;
+  for (let redirects = 0; redirects <= 5; redirects++) {
+    currentUrl = await validatePublicHttpsUrl(currentUrl);
+    const response = await fetch(currentUrl, {redirect: 'manual', signal: AbortSignal.timeout(Number(process.env.REMOTE_FETCH_TIMEOUT_MS || 20 * 60 * 1000))});
+    if ([301,302,303,307,308].includes(response.status)) {
+      const location = response.headers.get('location');
+      if (!location || redirects === 5) throw new Error('Remote file URL redirected too many times.');
+      currentUrl = new URL(location, currentUrl).toString();
+      continue;
+    }
+    if (!response.ok || !response.body) throw new Error(`Remote file server returned HTTP ${response.status}.`);
+    const declared = Number(response.headers.get('content-length') || 0);
+    if (declared > maxBytes) throw new Error(`Remote ${path.extname(destination).slice(1).toUpperCase()} exceeds the allowed size.`);
+    let received = 0;
+    const counter = new Transform({transform(chunk, _encoding, callback) {
+      received += chunk.length;
+      if (received > maxBytes) return callback(new Error('Remote file exceeded its allowed size while downloading.'));
+      onProgress(received, declared || null);
+      callback(null, chunk);
+    }});
+    await pipeline(Readable.fromWeb(response.body), counter, fs.createWriteStream(destination, {flags: 'wx'}));
+    if (declared && received !== declared) throw new Error('Remote file download ended before the declared size was received.');
+    if (received < 1) throw new Error('Remote file was empty.');
+    return received;
+  }
+  throw new Error('Remote file URL could not be fetched.');
+}
+const captchaLimiter = rateLimit({windowMs: 60_000, limit: 12, standardHeaders: 'draft-8', legacyHeaders: false, message: {error: 'Too many CAPTCHA verification attempts. Try again shortly.'}});
+app.post('/api/captcha/verify', captchaLimiter, async (req, res) => {
+  const token = typeof req.body?.captchaToken === 'string' ? req.body.captchaToken.trim() : '';
+  if (!token) return res.status(400).json({error: 'Complete reCAPTCHA before continuing.'});
+  try {
+    await verifyGoogleCaptcha(token, req);
+    const captchaPass = crypto.randomBytes(32).toString('base64url');
+    const now = Date.now();
+    for (const [key, value] of captchaPasses) if (value.expiresAt < now) captchaPasses.delete(key);
+    captchaPasses.set(captchaPass, {ip: normalizedClientIp(req), expiresAt: now + 30 * 60 * 1000});
+    res.set('Cache-Control', 'no-store').json({ok: true, captchaPass, expiresInSeconds: 1800});
+  } catch (error) {
+    console.error('reCAPTCHA preflight failed:', messageOf(error));
+    res.status(error.status || 503).json({error: error.status ? messageOf(error) : 'Google reCAPTCHA verification is temporarily unavailable. Please retry.'});
+  }
+});
 
 app.get('/health', (_req, res) => res.status(200).json({
   ok: true,
@@ -190,19 +363,46 @@ app.get('/health', (_req, res) => res.status(200).json({
   recaptchaConfigured: Boolean(RECAPTCHA_SECRET_KEY),
   diskPath: ROOT
 }));
-app.get('/api/config', (_req, res) => res.json({
+app.get('/api/config', (req, res) => res.json({
   maxIpaBytes: MAX_IPA_BYTES,
   maxSmallFileBytes: MAX_SMALL_FILE_BYTES,
   partSizeBytes: PART_SIZE,
   publicOrigin: PUBLIC_ORIGIN || null,
-  recaptchaSiteKey: '6Lfg6_gtAAAAAI9zK0Uvquy2dG2Qk7op92wVzXVH'
+  recaptchaSiteKey: '6Lfg6_gtAAAAAI9zK0Uvquy2dG2Qk7op92wVzXVH',
+  ownerApiVisible: isOwnerRequest(req)
 }));
 
+app.get('/api/owner/discord-api-docs', (req, res) => {
+  if (!isOwnerRequest(req)) return res.status(404).json({error: 'Not found.'});
+  const origin = (PUBLIC_ORIGIN || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '');
+  res.set('Cache-Control', 'no-store').json({
+    title: 'Discord bot signing API', endpoint: `${origin}/sign`, method: 'POST', auth: 'No API key required. Requests are rate-limited per source IP and remote URLs are restricted to public HTTPS hosts.',
+    fields: [
+      {name:'ipaUrl',type:'string',required:true,description:'Public HTTPS URL for the source .ipa file.'},
+      {name:'p12Url',type:'string',required:true,description:'Public HTTPS URL for the .p12/.pfx certificate.'},
+      {name:'mobileprovisionUrl',type:'string',required:true,description:'Public HTTPS URL for the .mobileprovision file.'},
+      {name:'password',type:'string',required:false,description:'P12 password; omit or use an empty string if unencrypted.'},
+      {name:'bundleId',type:'string',required:false,description:'Optional bundle ID override.'},
+      {name:'bundleName',type:'string',required:false,description:'Optional display name override.'},
+      {name:'bundleVersion',type:'string',required:false,description:'Optional version override.'}
+    ],
+    example: JSON.stringify({ipaUrl:'https://files.example.com/app.ipa',p12Url:'https://files.example.com/certificate.p12',mobileprovisionUrl:'https://files.example.com/profile.mobileprovision',password:'',bundleId:'com.example.app',bundleName:'Example App',bundleVersion:'1.0'},null,2),
+    response: JSON.stringify({ok:true,jobId:'<job-uuid>',jobToken:'<bearer-token>',status:'queued',statusUrl:'/api/jobs/<job-uuid>?after=0',downloadUrlEndpoint:'/api/jobs/<job-uuid>/download-url',otaUrlEndpoint:'/api/jobs/<job-uuid>/ota-url'},null,2),
+    polling: `curl -H "Authorization: Bearer JOB_TOKEN" "${origin}/api/jobs/JOB_ID?after=0"`,
+    download: `curl -X POST -H "Authorization: Bearer JOB_TOKEN" -H "Content-Type: application/json" -d '{}' "${origin}/api/jobs/JOB_ID/download-url"`,
+    ota: `curl -X POST -H "Authorization: Bearer JOB_TOKEN" -H "Content-Type: application/json" -d '{}' "${origin}/api/jobs/JOB_ID/ota-url"`
+  });
+});
+
 app.post('/api/jobs', createLimiter, async (req, res) => {
-  if (!storageConfigured()) return res.status(503).json({error: 'Backblaze B2 is not configured. Add the required B2 environment variables in Render.'});
+  if (!storageConfigured()) return res.status(503).json({error: 'Tigris storage is not configured. Add the required AWS/S3 environment variables in Render.'});
   if (!JOB_ENCRYPTION_KEY) return res.status(503).json({error: 'The job encryption key is not configured in Render.'});
   const provided = req.body?.files;
   if (!provided || typeof provided !== 'object') return res.status(400).json({error: 'File metadata is required.'});
+  const captchaPass = typeof req.body?.captchaPass === 'string' ? req.body.captchaPass : '';
+  const ipaUrlRaw = clampText(req.body?.ipaUrl || req.body?.ipa_url || req.body?.urls?.ipa, 4096);
+  let remoteIpaUrl = '';
+  if (ipaUrlRaw) { try { remoteIpaUrl = await validatePublicHttpsUrl(ipaUrlRaw); } catch (error) { return res.status(400).json({error: `Invalid IPA URL: ${messageOf(error)}`}); } }
   const specs = {
     ipa: {ext: '.ipa', max: MAX_IPA_BYTES, required: true},
     certificate: {exts: ['.p12', '.pfx'], max: MAX_SMALL_FILE_BYTES, required: true},
@@ -214,8 +414,12 @@ app.post('/api/jobs', createLimiter, async (req, res) => {
   const normalized = {};
   for (const kind of Object.keys(specs)) {
     const item = provided[kind];
+    if ((!item || typeof item !== 'object') && kind === 'ipa' && remoteIpaUrl) {
+      normalized[kind] = {name: remoteFilename(remoteIpaUrl, 'ipa'), size: null, contentType: 'application/octet-stream', sourceUrl: remoteIpaUrl};
+      continue;
+    }
     if (!item || typeof item !== 'object') {
-      if (specs[kind].required) return res.status(400).json({error: `Missing ${kind} file.`});
+      if (specs[kind].required) return res.status(400).json({error: `Missing ${kind} file${kind === 'ipa' ? ' or public HTTPS IPA URL' : ''}.`});
       continue;
     }
     const name = clampText(item.name, 240);
@@ -228,10 +432,11 @@ app.post('/api/jobs', createLimiter, async (req, res) => {
     if (!validExt) return res.status(400).json({error: `Invalid ${kind} file type.`});
     normalized[kind] = {name, size, contentType: clampText(item.type, 120) || 'application/octet-stream'};
   }
+  if (!consumeCaptchaPass(captchaPass, req)) return res.status(403).json({error: 'Complete reCAPTCHA before uploading files. The verification pass is expired or already used.'});
   const id = newId();
   const token = crypto.randomBytes(32).toString('base64url');
   const manifest = {
-    id, tokenHash: hashToken(token).toString('hex'),
+    id, tokenHash: hashToken(token).toString('hex'), source: 'web', captchaVerifiedAt: Date.now(),
     status: 'creating_uploads', phase: 'preparing', progress: 0,
     createdAt: Date.now(), updatedAt: Date.now(),
     uploads: {}, settings: null, passwordCipher: null,
@@ -244,6 +449,10 @@ app.post('/api/jobs', createLimiter, async (req, res) => {
       // Optional uploads (icon, dylib, deb) are absent unless selected.
       // Do not attempt to create a multipart upload for a missing file.
       if (!metadata) continue;
+      if (metadata.sourceUrl) {
+        manifest.uploads[kind] = makeRemoteUpload(kind, metadata.sourceUrl, metadata.name);
+        continue;
+      }
       const key = `uploads/${id}/${kind}${path.extname(metadata.name).toLowerCase()}`;
       const result = await getS3().send(new CreateMultipartUploadCommand({
         Bucket: BUCKET, Key: key, ContentType: metadata.contentType,
@@ -261,7 +470,8 @@ app.post('/api/jobs', createLimiter, async (req, res) => {
     res.status(201).json({jobId: id, jobToken: token, partSizeBytes: PART_SIZE, files: Object.fromEntries(Object.entries(manifest.uploads).map(([kind, value]) => [kind, {partCount: value.partCount, size: value.expectedSize}]))});
   } catch (error) {
     await cleanupInputs(manifest).catch(() => {});
-    await removeObject(s3KeyForManifest(id));
+    await fsp.rm(localManifestPath(id), {force: true}).catch(() => {});
+    manifestCache.delete(id);
     console.error('job creation failed:', JSON.stringify({
       message: messageOf(error),
       name: error?.name || null,
@@ -269,7 +479,7 @@ app.post('/api/jobs', createLimiter, async (req, res) => {
       httpStatusCode: error?.$metadata?.httpStatusCode || null,
       requestId: error?.$metadata?.requestId || null
     }));
-    res.status(503).json({error: 'Could not start a Backblaze upload. Check the B2 bucket, credentials, and permissions.'});
+    res.status(503).json({error: `Could not start a Tigris upload. Check the bucket, credentials, and permissions. (${messageOf(error)})`});
   }
 });
 
@@ -312,17 +522,9 @@ app.post('/api/jobs/:id/complete-upload', partLimiter, async (req, res) => {
       Bucket: BUCKET, Key: upload.key, UploadId: upload.uploadId,
       MultipartUpload: {Parts: normalized}
     }));
-    const head = await getS3().send(new HeadObjectCommand({Bucket: BUCKET, Key: upload.key}));
-    if (Number(head.ContentLength) !== upload.expectedSize) {
-      await removeObject(upload.key);
-      manifest.status = 'failed'; manifest.phase = 'failed';
-      manifest.error = 'Uploaded file size did not match the selected file. Please start a new job.';
-      await cleanupInputs(manifest).catch(() => {});
-      await putManifest(manifest);
-      return res.status(400).json({error: manifest.error});
-    }
+    // Presigned part URLs bind each part's Content-Length; avoid an additional Class B HEAD read.
     upload.completed = true;
-    upload.actualSize = Number(head.ContentLength);
+    upload.actualSize = upload.expectedSize;
     upload.uploadId = null;
     const allComplete = Object.values(manifest.uploads).every(value => value.completed);
     if (allComplete) { manifest.status = 'ready'; manifest.phase = 'ready_to_sign'; manifest.progress = 64; }
@@ -330,7 +532,7 @@ app.post('/api/jobs/:id/complete-upload', partLimiter, async (req, res) => {
     res.json({ok: true, kind, completed: true, allComplete});
   } catch (error) {
     console.error('complete upload failed:', messageOf(error));
-    res.status(400).json({error: 'Backblaze could not finalize this upload. Retry or start the upload again.'});
+    res.status(400).json({error: 'Tigris could not finalize this upload. Retry or start the upload again.'});
   }
 });
 
@@ -340,23 +542,9 @@ app.post('/api/jobs/:id/sign', actionLimiter, async (req, res) => {
   if (manifest.status !== 'ready' || !['ipa', 'certificate', 'profile'].every(kind => manifest.uploads?.[kind]?.completed)) {
     return res.status(409).json({error: 'Upload the IPA, P12, and mobileprovision before signing.'});
   }
-  const captchaToken = typeof req.body?.captchaToken === 'string' ? req.body.captchaToken.trim() : '';
-  if (!captchaToken) return res.status(400).json({error: 'Complete the reCAPTCHA check before signing.'});
-  if (!RECAPTCHA_SECRET_KEY) return res.status(503).json({error: 'reCAPTCHA verification is not configured on the server. Add RECAPTCHA_SECRET_KEY in Render.'});
-  try {
-    const verifyBody = new URLSearchParams({secret: RECAPTCHA_SECRET_KEY, response: captchaToken});
-    if (req.ip) verifyBody.set('remoteip', req.ip);
-    const captchaResponse = await fetch('https://www.google.com/recaptcha/api/siteverify', {method: 'POST', headers: {'content-type': 'application/x-www-form-urlencoded'}, body: verifyBody, signal: AbortSignal.timeout(10_000)});
-    const captcha = await captchaResponse.json();
-    const expectedHosts = (process.env.RECAPTCHA_ALLOWED_HOSTNAMES || req.hostname || 'xsigner.onrender.com').split(',').map(value => value.trim().toLowerCase()).filter(Boolean);
-    if (!captchaResponse.ok || captcha.success !== true || !expectedHosts.includes(String(captcha.hostname || '').toLowerCase())) {
-      console.warn('reCAPTCHA rejected a signing request:', JSON.stringify({success: captcha.success === true, hostname: captcha.hostname || null, errors: captcha['error-codes'] || []}));
-      return res.status(403).json({error: 'reCAPTCHA verification failed or expired. Complete the checkbox again and retry.'});
-    }
-  } catch (error) {
-    console.error('reCAPTCHA verification unavailable:', messageOf(error));
-    return res.status(503).json({error: 'Google reCAPTCHA verification is temporarily unavailable. Please retry.'});
-  }
+  // Website requests must pass server-verified CAPTCHA before any upload begins.
+  // /sign is a separately rate-limited public bot endpoint and queues its own URL-only jobs.
+  if (manifest.source !== 'api' && !manifest.captchaVerifiedAt) return res.status(403).json({error: 'Complete reCAPTCHA before signing.'});
   const password = typeof req.body?.password === 'string' ? req.body.password : '';
   if (password.length > 2048) return res.status(400).json({error: 'P12 password is too long.'});
   const bundleId = clampText(req.body?.bundleId, 200);
@@ -375,6 +563,55 @@ app.post('/api/jobs/:id/sign', actionLimiter, async (req, res) => {
   } catch (error) {
     console.error('could not queue signing:', messageOf(error));
     res.status(503).json({error: 'Could not queue this signing job. Check the server encryption key and storage.'});
+  }
+});
+
+const publicSignLimiter = rateLimit({windowMs: 15 * 60_000, limit: 6, standardHeaders: 'draft-8', legacyHeaders: false, message: {error: 'Too many public signing requests from this IP. Retry later.'}});
+app.post('/sign', publicSignLimiter, async (req, res) => {
+  if (!storageConfigured()) return res.status(503).json({error: 'Tigris storage is not configured.'});
+  if (!JOB_ENCRYPTION_KEY) return res.status(503).json({error: 'Signing job encryption is not configured.'});
+  const body = req.body || {};
+  const rawUrls = {
+    ipa: clampText(body.ipaUrl || body.ipa_url, 4096),
+    certificate: clampText(body.p12Url || body.p12_url || body.certificateUrl, 4096),
+    profile: clampText(body.mobileprovisionUrl || body.mobileprovision_url || body.profileUrl || body.profile_url, 4096)
+  };
+  if (!rawUrls.ipa || !rawUrls.certificate || !rawUrls.profile) return res.status(400).json({error: 'Provide ipaUrl, p12Url, and mobileprovisionUrl as public HTTPS URLs.'});
+  const urls = {};
+  try { for (const kind of Object.keys(rawUrls)) urls[kind] = await validatePublicHttpsUrl(rawUrls[kind]); }
+  catch (error) { return res.status(400).json({error: `Invalid source URL: ${messageOf(error)}`}); }
+  const password = typeof body.password === 'string' ? body.password : '';
+  if (password.length > 2048) return res.status(400).json({error: 'P12 password is too long.'});
+  const bundleId = clampText(body.bundleId || body.bundle_id, 200);
+  if (bundleId && !/^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/.test(bundleId)) return res.status(400).json({error: 'Bundle ID format is invalid.'});
+  const bundleName = clampText(body.bundleName || body.bundle_name, 200);
+  const bundleVersion = clampText(body.bundleVersion || body.bundle_version, 100);
+  if (bundleVersion && !/^[A-Za-z0-9._+-]+$/.test(bundleVersion)) return res.status(400).json({error: 'Version format is invalid.'});
+  const id = newId();
+  const token = crypto.randomBytes(32).toString('base64url');
+  const manifest = {
+    id, tokenHash: hashToken(token).toString('hex'), source: 'api', status: 'queued', phase: 'queued', progress: 64,
+    createdAt: Date.now(), updatedAt: Date.now(),
+    uploads: {
+      ipa: makeRemoteUpload('ipa', urls.ipa, clampText(body.ipaName || body.ipa_name, 240)),
+      certificate: makeRemoteUpload('certificate', urls.certificate, clampText(body.p12Name || body.certificateName, 240)),
+      profile: makeRemoteUpload('profile', urls.profile, clampText(body.mobileprovisionName || body.profileName, 240))
+    },
+    settings: {bundleId, bundleName, bundleVersion, injectExtensions: body.injectExtensions === true},
+    passwordCipher: encryptPassword(password), resultKey: null, resultSize: null, error: null,
+    logs: [], logSequence: 0, otaTokenHash: null, otaExpiresAt: null, otaMetadata: null
+  };
+  try {
+    manifestCache.set(id, manifest);
+    appendJobLog(manifest, 'API signing request accepted. No API key is required; per-IP rate limiting is enabled.', 'system', password);
+    await flushManifest(manifest);
+    enqueue(id);
+    const origin = (PUBLIC_ORIGIN || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '');
+    res.status(202).set('Cache-Control', 'no-store').json({ok: true, jobId: id, jobToken: token, status: 'queued', statusUrl: `${origin}/api/jobs/${id}?after=0`, downloadUrlEndpoint: `${origin}/api/jobs/${id}/download-url`, otaUrlEndpoint: `${origin}/api/jobs/${id}/ota-url`});
+  } catch (error) {
+    console.error('public /sign request failed:', messageOf(error));
+    manifest.passwordCipher = null;
+    res.status(503).json({error: 'Could not queue the signing request. Check object storage and encryption configuration.'});
   }
 });
 
@@ -405,7 +642,7 @@ app.post('/api/jobs/:id/download-url', actionLimiter, async (req, res) => {
     res.set('Cache-Control', 'no-store').json({url, expiresIn: 3600});
   } catch (error) {
     console.error('download presign failed:', messageOf(error));
-    res.status(503).json({error: 'Could not create the download link. Try again shortly.'});
+    res.status(503).json({error: 'Could not create the download link. Check object storage configuration and try again shortly.'});
   }
 });
 
@@ -508,7 +745,7 @@ async function findFilesByExtension(root, extension) {
   return result;
 }
 
-async function writeB2ObjectToFile(key, destination, onBytes = () => {}) {
+async function writeS3ObjectToFile(key, destination, onBytes = () => {}) {
   const response = await getS3().send(new GetObjectCommand({Bucket: BUCKET, Key: key}));
   const counter = new Transform({
     transform(chunk, _encoding, callback) {
@@ -531,7 +768,7 @@ function scheduleManifestFlush(manifest) {
       console.warn('could not persist live job output:', messageOf(error));
     });
     manifestFlushPromises.set(manifest.id, pending);
-  }, 650);
+  }, 2500);
   timer.unref?.();
   manifestFlushTimers.set(manifest.id, timer);
 }
@@ -666,14 +903,38 @@ async function runSigningJob(id) {
     for (const kind of Object.keys(manifest.uploads || {})) {
       const upload = manifest.uploads[kind];
       local[kind] = path.join(workDir, `input-${kind}${path.extname(upload.filename).toLowerCase()}`);
-      appendJobLog(manifest, `Downloading ${kind} (${upload.filename}, ${upload.expectedSize} bytes).`, 'system', password);
-      await writeB2ObjectToFile(upload.key, local[kind], bytes => {
-        downloadedInputBytes += bytes;
-        if (totalInputBytes > 0) manifest.progress = Math.max(Number(manifest.progress || 0), Math.min(70, 64 + Math.floor(6 * downloadedInputBytes / totalInputBytes)));
-        scheduleManifestFlush(manifest);
-      });
+      if (upload.sourceUrl) {
+        appendJobLog(manifest, `Downloading ${kind} from the supplied HTTPS URL (${upload.filename}) into temporary signing workspace.`, 'system', password);
+        let lastLoggedPercent = -10;
+        const remoteIndex = Object.keys(manifest.uploads).indexOf(kind);
+        const remoteCount = Math.max(1, Object.values(manifest.uploads).filter(value => value.sourceUrl).length);
+        const downloadedSize = await downloadRemoteToFile(upload.sourceUrl, local[kind], Number(upload.maxBytes || (kind === 'ipa' ? MAX_IPA_BYTES : MAX_SMALL_FILE_BYTES)), (loaded, total) => {
+          if (total && total > 0) {
+            const pct = Math.floor(100 * loaded / total);
+            manifest.progress = Math.max(Number(manifest.progress || 0), Math.min(70, 64 + Math.floor(6 * (remoteIndex + loaded / total) / remoteCount)));
+            if (pct >= lastLoggedPercent + 10 || pct === 100) { lastLoggedPercent = Math.floor(pct / 10) * 10; appendJobLog(manifest, `${kind.toUpperCase()} URL download: ${pct}% (${formatBytesSafe(loaded)} / ${formatBytesSafe(total)}).`, 'system', password); }
+          } else if (loaded > 0 && loaded % (10 * 1024 * 1024) < 1024 * 1024) {
+            appendJobLog(manifest, `${kind.toUpperCase()} URL download: ${formatBytesSafe(loaded)} received (server did not provide total size).`, 'system', password);
+          }
+          scheduleManifestFlush(manifest);
+        });
+        upload.expectedSize = downloadedSize;
+        upload.actualSize = downloadedSize;
+      } else {
+        appendJobLog(manifest, `Downloading ${kind} (${upload.expectedSize} bytes) from private Tigris storage.`, 'system', password);
+        let lastMilestone = -10;
+        let downloadedForThisFile = 0;
+        await writeS3ObjectToFile(upload.key, local[kind], bytes => {
+          downloadedInputBytes += bytes;
+          downloadedForThisFile += bytes;
+          if (totalInputBytes > 0) manifest.progress = Math.max(Number(manifest.progress || 0), Math.min(70, 64 + Math.floor(6 * downloadedInputBytes / totalInputBytes)));
+          const pct = upload.expectedSize ? Math.floor(100 * downloadedForThisFile / upload.expectedSize) : 0;
+          if (pct >= lastMilestone + 10 || pct === 100) { lastMilestone = Math.floor(pct / 10) * 10; appendJobLog(manifest, `${kind.toUpperCase()} Tigris download: ${pct}% (${formatBytesSafe(downloadedForThisFile)} / ${formatBytesSafe(upload.expectedSize)}).`, 'system', password); }
+          scheduleManifestFlush(manifest);
+        });
+      }
       const info = await fsp.stat(local[kind]);
-      if (info.size !== upload.expectedSize) throw new Error(`Downloaded ${kind} size verification failed.`);
+      if (upload.expectedSize && info.size !== upload.expectedSize) throw new Error(`Downloaded ${kind} size verification failed.`);
       appendJobLog(manifest, `Verified ${kind} on the signing worker (${info.size} bytes).`, 'system', password);
       await flushManifest(manifest);
     }
@@ -744,10 +1005,18 @@ async function runSigningJob(id) {
       },
       queueSize: 2, partSize: Math.max(64 * 1024 * 1024, PART_SIZE), leavePartsOnError: false
     });
+    let lastResultUploadMark = -5;
     uploader.on('httpUploadProgress', event => {
       const loaded = Number(event.loaded || 0);
       const total = Number(event.total || outputStat.size);
-      if (total > 0) manifest.progress = Math.max(Number(manifest.progress || 0), Math.min(99, 91 + Math.floor(8 * loaded / total)));
+      if (total > 0) {
+        manifest.progress = Math.max(Number(manifest.progress || 0), Math.min(99, 91 + Math.floor(8 * loaded / total)));
+        const pct = Math.min(100, Math.floor(100 * loaded / total));
+        if (pct >= lastResultUploadMark + 5 || pct === 100) {
+          lastResultUploadMark = Math.floor(pct / 5) * 5;
+          appendJobLog(manifest, `Tigris result upload: ${pct}% (${formatBytesSafe(loaded)} / ${formatBytesSafe(total)}).`, 'system', password);
+        }
+      }
       scheduleManifestFlush(manifest);
     });
     await uploader.done();
@@ -761,7 +1030,8 @@ async function runSigningJob(id) {
     password = '';
     await flushManifest(manifest);
   } catch (error) {
-    const safeError = safeTerminalLine(messageOf(error), password).slice(0, 2000) || 'Signing job failed.';
+    const rawError = messageOf(error);
+    const safeError = safeTerminalLine(rawError, password).slice(0, 2000) || 'Signing job failed.';
     console.error(`signing job ${id} failed:`, safeError);
     if (manifest) {
       appendJobLog(manifest, safeError, 'error', password);
@@ -816,7 +1086,9 @@ async function cleanupExpiredJobs() {
       if (age > ttl) {
         await cleanupInputs(manifest, true).catch(() => {});
         if (manifest.resultKey) await removeObject(manifest.resultKey);
-        await removeObject(key);
+        if (!isLocalManifestStorage()) await removeObject(key);
+        await fsp.rm(localManifestPath(id), {force: true}).catch(() => {});
+        manifestCache.delete(id);
       }
     }
   } catch (error) {
@@ -925,14 +1197,15 @@ app.use((error, _req, res, _next) => {
 });
 
 const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`xsigner listening on 0.0.0.0:${PORT}; B2 configured=${storageConfigured()}`);
+  console.log(`xsigner listening on 0.0.0.0:${PORT}; Tigris configured=${storageConfigured()}`);
+  // One best-effort recovery scan per process start. Polling no longer lists/downloads every remote manifest.
   void recoverJobs({recoverInterruptedImmediately: true});
 });
-const recoveryTimer = setInterval(() => void recoverJobs(), 60_000).unref();
-const cleanupTimer = setInterval(() => void cleanupExpiredJobs(), 15 * 60_000).unref();
+const maintenanceIntervalMs = Number(process.env.S3_MAINTENANCE_INTERVAL_MS || 0);
+const maintenanceTimer = maintenanceIntervalMs >= 60 * 60_000 ? setInterval(() => { void recoverJobs(); void cleanupExpiredJobs(); }, maintenanceIntervalMs).unref() : null;
 
 async function shutdown() {
-  clearInterval(recoveryTimer); clearInterval(cleanupTimer);
+  if (maintenanceTimer) clearInterval(maintenanceTimer);
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(1), 25_000).unref();
 }
