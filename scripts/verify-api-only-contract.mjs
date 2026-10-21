@@ -35,10 +35,11 @@ assert(source.includes('statusUrl, status_url: statusUrl, progressUrl: statusUrl
 assert(source.includes('clientPollTokenHash'), 'legacy Discord bot shared-bearer polling compatibility missing');
 assert(source.includes('response.result = await buildApiCompletionResult(manifest, req)'), 'completed job must include result object');
 assert(source.includes('result.otaUrl = installUrl') && source.includes('result.downloadUrl = downloadUrl'), 'bot result needs OTA and download URL aliases');
-assert(source.includes("success: false, ok: false, error: 'Too many signing requests"), 'rate-limit errors should be JSON');
+assert(source.includes("success: false, ok: false, error: 'Too many anonymous signing requests"), 'anonymous rate-limit errors should be JSON');
 assert(!docker.includes('COPY public ./public'), 'Docker image should not copy a website frontend');
 assert(!yaml.includes('RECAPTCHA_SECRET_KEY'), 'API-only deployment should not require browser CAPTCHA');
 assert(yaml.includes('API_SIGN_RATE_LIMIT'), 'API-only deployment should document/set a bot-friendly IP rate limit');
+assert(source.includes('authenticateApiClientAndApplyQuota'), 'optional bot API-key authentication middleware must be present');
 assert(client.includes('export async function submitAndPollXsign(input)'), 'Discord Node.js helper should expose submit + poll workflow');
 assert(client.includes('Authorization: `Bearer ${initial.jobToken}`'), 'Discord helper must poll with the returned job-scoped token');
 assert(client.includes("form.append('certificate'"), 'Discord helper must use the provided bot field aliases');

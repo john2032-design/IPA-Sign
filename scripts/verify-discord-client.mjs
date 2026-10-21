@@ -4,6 +4,7 @@ import {submitAndPollXsign, wrapOtaInstallUrl} from '../examples/discord-sign-ap
 const originalFetch = globalThis.fetch;
 const calls = [];
 let uploadedForm = null;
+let expectedApiKey = null;
 let progressCalls = 0;
 globalThis.fetch = async (urlValue, options = {}) => {
   const url = String(urlValue);
@@ -13,6 +14,8 @@ globalThis.fetch = async (urlValue, options = {}) => {
   }
   if (url === 'https://api.example/api/v1/discord/sign') {
     assert.equal(options.method, 'POST');
+    if (expectedApiKey) assert.equal(options.headers?.['X-API-Key'], expectedApiKey, 'configured bot key must be sent on submission');
+    else assert.equal(options.headers?.['X-API-Key'], undefined, 'legacy default request must omit the API-key header');
     assert.ok(options.body instanceof FormData, 'Discord client must submit FormData');
     uploadedForm = options.body;
     assert.equal(uploadedForm.get('ipaUrl'), 'https://cdn.example/app.ipa');
@@ -60,7 +63,17 @@ try {
   assert.equal(progressCalls, 1);
   assert.equal(wrapOtaInstallUrl(result.otaUrl, 'https://install.example').startsWith('https://install.example/install.html?ota='), true);
   assert.equal(calls.length, 4, 'two attachment downloads, one submit, and one poll are expected');
-  console.log('Discord client mock integration passed: multipart aliases, ipaUrl-only source, job-token polling, progress, download, and OTA result.');
+
+  expectedApiKey = 'mock-only-api-key-that-is-long-enough-for-a-test-123';
+  await submitAndPollXsign({
+    apiBase: 'https://api.example', ipaUrl: 'https://cdn.example/app.ipa',
+    certificate: {url: 'https://discord-files.example/cert', name: 'cert.p12'},
+    profile: {url: 'https://discord-files.example/profile', name: 'profile.mobileprovision'},
+    password: 'example-password', appName: 'Example App', bundleId: 'com.example.app', version: '1.2.3', apiKey: expectedApiKey
+  });
+  const secondSubmit = calls.slice(4).find(call => call.url === 'https://api.example/api/v1/discord/sign');
+  assert.equal(secondSubmit.options.headers['X-API-Key'], expectedApiKey, 'optional API key should be attached only to submission');
+  console.log('Discord client mock integration passed: legacy no-key mode, optional X-API-Key mode, multipart aliases, job-token polling, progress, download, and OTA result.');
 } finally {
   globalThis.fetch = originalFetch;
 }

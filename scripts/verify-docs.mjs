@@ -30,3 +30,7 @@ for (const route of ['/sign','/api/v1/discord/sign','/api/jobs/{jobId}','/api/jo
 }
 assert(openapi.info.version && openapi.openapi === '3.1.0', 'OpenAPI metadata is invalid');
 console.log('Owner-only /doc page, OpenAPI routes, fields, response/error docs, and Docker packaging checks passed.');
+
+assert(server.includes("app.get('/api/ops/metrics', requireOwnerDocs, async"), 'owner-only operational metrics endpoint missing');
+assert(html.includes('/api/ops/metrics'), 'API docs must document owner-only operational metrics');
+assert(openapi.paths['/api/ops/metrics']?.get, 'OpenAPI must document operational metrics');
