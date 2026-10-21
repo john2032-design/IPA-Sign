@@ -51,10 +51,13 @@ const checkerUpload = multer({storage: multer.memoryStorage(), limits: {fileSize
 const API_SIGN_FILE_LIMITS = {
   ipa: MAX_IPA_BYTES,
   p12: MAX_SMALL_FILE_BYTES,
+  certificate: MAX_SMALL_FILE_BYTES, // Discord bot compatibility alias for p12
   mobileprovision: MAX_SMALL_FILE_BYTES,
+  profile: MAX_SMALL_FILE_BYTES, // Discord bot compatibility alias for mobileprovision
   icon: MAX_SMALL_FILE_BYTES,
   deb: 256 * 1024 * 1024,
-  dylib: 128 * 1024 * 1024
+  dylib: 128 * 1024 * 1024,
+  tweaks: 256 * 1024 * 1024 // Legacy bot field; extension validation happens in fileFilter
 };
 const apiSignStorage = {
   _handleFile(_req, file, callback) {
@@ -99,6 +102,13 @@ const apiSignUpload = multer({
   {name: 'mobileprovision', maxCount: 1}, {name: 'profile', maxCount: 1},
   {name: 'icon', maxCount: 1}, {name: 'deb', maxCount: 1}, {name: 'dylib', maxCount: 1}, {name: 'tweaks', maxCount: 2}
 ]);
+function handleApiSignUpload(req, res, next) {
+  apiSignUpload(req, res, error => {
+    if (!error) return next();
+    const status = Number(error.status) || (error.code === 'LIMIT_FILE_SIZE' ? 413 : 400);
+    return res.status(status).json({success: false, ok: false, error: messageOf(error)});
+  });
+}
 
 await fsp.mkdir(WORK_ROOT, {recursive: true});
 await fsp.mkdir(MANIFEST_ROOT, {recursive: true, mode: 0o700});
@@ -106,7 +116,13 @@ await fsp.mkdir(MANIFEST_ROOT, {recursive: true, mode: 0o700});
 app.disable('x-powered-by');
 app.use(helmet({contentSecurityPolicy: false, crossOriginEmbedderPolicy: false}));
 app.use(express.json({limit: '1mb'}));
-app.use(express.static(path.join(process.cwd(), 'public'), {maxAge: '1h', etag: true}));
+app.use(express.static(path.join(process.cwd(), 'public'), {
+  maxAge: '1h', etag: true,
+  setHeaders(res, filePath) {
+    // Prevent a cached index.html from keeping the owner-only sidebar state stale after deploys.
+    if (path.basename(filePath).toLowerCase() === 'index.html') res.setHeader('Cache-Control', 'no-store, max-age=0');
+  }
+}));
 
 const createLimiter = rateLimit({windowMs: 60_000, limit: 8, standardHeaders: 'draft-8', legacyHeaders: false, message: {error: 'Too many jobs created. Try again in a minute.'}});
 const partLimiter = rateLimit({windowMs: 60_000, limit: 240, standardHeaders: 'draft-8', legacyHeaders: false, message: {error: 'Too many upload requests. Slow down and retry.'}});
@@ -117,9 +133,30 @@ let s3Client;
 // Hot manifest cache: polling must not download manifest.json from object storage on every browser poll.
 // S3-compatible storage is durable; cached metadata is only process memory.
 const manifestCache = new Map();
-const OWNER_IP = String(process.env.OWNER_IP || process.env.XSIGNER_OWNER_IP || '168.91.23.165').trim().replace(/^::ffff:/i, '').split('%')[0];
-function normalizedClientIp(req) { return String(req.ip || req.socket?.remoteAddress || '').replace(/^::ffff:/i, '').split('%')[0]; }
-function isOwnerRequest(req) { return normalizedClientIp(req) === OWNER_IP; }
+function normalizeIp(value) {
+  let candidate = String(value ?? '').trim();
+  if (!candidate || candidate.includes(',')) return '';
+  candidate = candidate.replace(/^::ffff:/i, '').split('%')[0];
+  return net.isIP(candidate) ? candidate.toLowerCase() : '';
+}
+const OWNER_IP = normalizeIp(process.env.OWNER_IP || process.env.XSIGNER_OWNER_IP || '168.91.23.165');
+function normalizedClientIp(req) {
+  // Public Render web services receive CF-Connecting-IP from Cloudflare. Render's current
+  // guidance describes it as overwritten by Cloudflare, unlike a caller-supplied leftmost
+  // X-Forwarded-For value. Do not trust X-Forwarded-For for this owner-only gate.
+  const cloudflareHeader = req.headers?.['cf-connecting-ip'];
+  if (cloudflareHeader !== undefined) return normalizeIp(Array.isArray(cloudflareHeader) ? '' : cloudflareHeader);
+  // Fail closed in production if the trusted edge header is absent. Local development can
+  // still test the route directly without a Cloudflare proxy.
+  if (process.env.NODE_ENV !== 'production') return normalizeIp(req.socket?.remoteAddress || req.ip);
+  return '';
+}
+function ownerIpDetectionSource(req) {
+  const value = req.headers?.['cf-connecting-ip'];
+  if (value !== undefined) return normalizeIp(Array.isArray(value) ? '' : value) ? 'cf-connecting-ip' : 'invalid-cf-connecting-ip';
+  return process.env.NODE_ENV !== 'production' ? 'local-socket-fallback' : 'missing-cf-connecting-ip';
+}
+function isOwnerRequest(req) { return Boolean(OWNER_IP && normalizedClientIp(req) && normalizedClientIp(req) === OWNER_IP); }
 function storageConfigured() {
   return Boolean(BUCKET && process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && ENDPOINT && REGION);
 }
@@ -229,11 +266,14 @@ async function maybeManifest(id) {
 }
 async function authorizedJob(req, res, id) {
   if (!validateId(id)) { res.status(400).json({error: 'Invalid job ID.'}); return null; }
-  const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  const header = String(req.headers.authorization || '');
+  const bearerMatch = /^Bearer\s+(.+)$/i.exec(header);
+  const token = bearerMatch ? bearerMatch[1].trim() : '';
   try {
     const manifest = await maybeManifest(id);
-    if (!manifest || !tokenMatches(token, manifest.tokenHash)) {
+    const jobTokenValid = Boolean(manifest && tokenMatches(token, manifest.tokenHash));
+    const callerTokenValid = Boolean(manifest && manifest.source === 'api' && manifest.clientPollTokenHash && tokenMatches(token, manifest.clientPollTokenHash));
+    if (!manifest || (!jobTokenValid && !callerTokenValid)) {
       res.status(404).json({error: 'Job not found or access token invalid.'});
       return null;
     }
@@ -419,7 +459,9 @@ app.get('/api/config', (req, res) => res.set('Cache-Control', 'private, no-store
   partSizeBytes: PART_SIZE,
   publicOrigin: PUBLIC_ORIGIN || null,
   recaptchaSiteKey: '6Lfg6_gtAAAAAI9zK0Uvquy2dG2Qk7op92wVzXVH',
-  ownerApiVisible: isOwnerRequest(req)
+  ownerApiVisible: isOwnerRequest(req),
+  ownerIpConfigured: Boolean(OWNER_IP),
+  ownerIpDetectionSource: ownerIpDetectionSource(req)
 }));
 
 app.get('/api/owner/discord-api-docs', (req, res) => {
@@ -647,7 +689,7 @@ app.post('/api/jobs/:id/sign', actionLimiter, async (req, res) => {
 app.get('/api/v1/discord/health', (_req, res) => res.status(200).json({status: 'ok', service: 'xsigner', dependencies: {signing_engine: 'zsign', storage: storageConfigured() ? 'tigris' : 'unconfigured'}}));
 
 const publicSignLimiter = rateLimit({windowMs: 15 * 60_000, limit: 6, standardHeaders: 'draft-8', legacyHeaders: false, message: {error: 'Too many public signing requests from this IP. Retry later.'}});
-app.post(['/sign', '/api/v1/discord/sign'], publicSignLimiter, apiSignUpload, async (req, res) => {
+app.post(['/sign', '/api/v1/discord/sign'], publicSignLimiter, handleApiSignUpload, async (req, res) => {
   const body = req.body || {};
   const files = req.files || {};
   const file = field => Array.isArray(files[field]) ? files[field][0] : null;
@@ -663,17 +705,17 @@ app.post(['/sign', '/api/v1/discord/sign'], publicSignLimiter, apiSignUpload, as
   let password = '';
 
   try {
-    if (!storageConfigured()) return res.status(503).json({error: 'Tigris storage is not configured.'});
-    if (!JOB_ENCRYPTION_KEY) return res.status(503).json({error: 'Signing job encryption is not configured.'});
+    if (!storageConfigured()) return res.status(503).json({success: false, ok: false, error: 'Tigris storage is not configured.'});
+    if (!JOB_ENCRYPTION_KEY) return res.status(503).json({success: false, ok: false, error: 'Signing job encryption is not configured.'});
 
     const rawIpaUrl = clampText(body.ipaUrl, 4096);
     // ipaUrl is the only URL accepted for source material. Certificates and profiles must be uploaded files.
     if (body.p12Url || body.p12_url || body.certificateUrl || body.mobileprovisionUrl || body.mobileprovision_url || body.profileUrl || body.profile_url) {
-      return res.status(400).json({error: 'Only ipaUrl may be provided as a URL. Upload p12 and mobileprovision as files.'});
+      return res.status(400).json({success: false, ok: false, error: 'Only ipaUrl may be provided as a URL. Upload p12 and mobileprovision as files.'});
     }
-    if (ipaFile && rawIpaUrl) return res.status(400).json({error: 'Provide either the ipa file or ipaUrl, not both.'});
-    if (!ipaFile && !rawIpaUrl) return res.status(400).json({error: 'Provide an ipa file or ipaUrl.'});
-    if (!p12File || !profileFile) return res.status(400).json({error: 'Upload required files using the p12 and mobileprovision fields.'});
+    if (ipaFile && rawIpaUrl) return res.status(400).json({success: false, ok: false, error: 'Provide either the ipa file or ipaUrl, not both.'});
+    if (!ipaFile && !rawIpaUrl) return res.status(400).json({success: false, ok: false, error: 'Provide an ipa file or ipaUrl.'});
+    if (!p12File || !profileFile) return res.status(400).json({success: false, ok: false, error: 'Upload required files using the p12 and mobileprovision fields.'});
 
     let ipaUrl = '';
     if (rawIpaUrl) {
@@ -681,18 +723,24 @@ app.post(['/sign', '/api/v1/discord/sign'], publicSignLimiter, apiSignUpload, as
       catch (error) { throw Object.assign(new Error(`Invalid IPA URL: ${messageOf(error)}`, {cause: error}), {status: 400}); }
     }
     password = typeof body.password === 'string' ? body.password : '';
-    if (password.length > 2048) return res.status(400).json({error: 'P12 password is too long.'});
+    if (password.length > 2048) return res.status(400).json({success: false, ok: false, error: 'P12 password is too long.'});
     const bundleId = clampText(body.bundleId || body.bundle_id, 200);
-    if (bundleId && !/^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/.test(bundleId)) return res.status(400).json({error: 'Bundle ID format is invalid.'});
+    if (bundleId && !/^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/.test(bundleId)) return res.status(400).json({success: false, ok: false, error: 'Bundle ID format is invalid.'});
     const bundleName = clampText(body.appName || body.app_name || body.bundleName || body.bundle_name, 200);
     const bundleVersion = clampText(body.bundleVersion || body.bundle_version || body.version, 100);
-    if (bundleVersion && !/^[A-Za-z0-9._+-]+$/.test(bundleVersion)) return res.status(400).json({error: 'Version format is invalid.'});
+    if (bundleVersion && !/^[A-Za-z0-9._+-]+$/.test(bundleVersion)) return res.status(400).json({success: false, ok: false, error: 'Version format is invalid.'});
     const injectExtensions = body.injectExtensions === true || ['true', '1', 'yes'].includes(String(body.injectExtensions || '').trim().toLowerCase());
 
     const id = newId();
     const token = crypto.randomBytes(32).toString('base64url');
+    const requestBearerMatch = /^Bearer\s+(.+)$/i.exec(String(req.headers.authorization || ''));
+    const optionalCallerBearer = requestBearerMatch ? requestBearerMatch[1].trim() : '';
+    // Public submission remains unauthenticated. If the caller sends a private bearer (as
+    // the provided Discord bot does), hash it onto this job for backward-compatible polling.
+    // New clients should use the returned jobToken instead.
+    const clientPollTokenHash = optionalCallerBearer.length >= 16 ? hashToken(optionalCallerBearer).toString('hex') : null;
     manifest = {
-      id, tokenHash: hashToken(token).toString('hex'), source: 'api', status: 'creating_uploads', phase: 'preparing', progress: 0,
+      id, tokenHash: hashToken(token).toString('hex'), clientPollTokenHash, source: 'api', status: 'creating_uploads', phase: 'preparing', progress: 0,
       createdAt: Date.now(), updatedAt: Date.now(), uploads: {},
       settings: {bundleId, bundleName, bundleVersion, injectExtensions},
       passwordCipher: encryptPassword(password), resultKey: null, resultSize: null, resultExpiresAt: null,
@@ -735,7 +783,15 @@ app.post(['/sign', '/api/v1/discord/sign'], publicSignLimiter, apiSignUpload, as
     await flushManifest(manifest);
     enqueue(manifest.id);
     const origin = (PUBLIC_ORIGIN || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '');
-    return res.status(202).set('Cache-Control', 'no-store').json({ok: true, jobId: manifest.id, jobToken: token, status: 'queued', statusUrl: `${origin}/api/jobs/${manifest.id}?after=0`, downloadUrlEndpoint: `${origin}/api/jobs/${manifest.id}/download-url`, otaUrlEndpoint: `${origin}/api/jobs/${manifest.id}/ota-url`});
+    const statusUrl = `${origin}/api/jobs/${manifest.id}?after=0`;
+    return res.status(202).set('Cache-Control', 'no-store').json({
+      success: true, ok: true, jobId: manifest.id, job_id: manifest.id, jobToken: token,
+      status: 'queued', stage: 'queued', progress: Number(manifest.progress || 0),
+      message: 'Signing request accepted and queued for zsign.', poll_after_ms: 1000,
+      statusUrl, status_url: statusUrl, progressUrl: statusUrl, progress_url: statusUrl,
+      downloadUrlEndpoint: `${origin}/api/jobs/${manifest.id}/download-url`,
+      otaUrlEndpoint: `${origin}/api/jobs/${manifest.id}/ota-url`
+    });
   } catch (error) {
     console.error('public /sign request failed:', messageOf(error));
     if (manifest) {
@@ -745,25 +801,85 @@ app.post(['/sign', '/api/v1/discord/sign'], publicSignLimiter, apiSignUpload, as
       await fsp.rm(localManifestPath(manifest.id), {force: true}).catch(() => {});
       manifestCache.delete(manifest.id);
     }
-    if (!res.headersSent) return res.status(error?.status || 503).json({error: error?.status ? messageOf(error) : 'Could not queue the signing request. Check object storage and encryption configuration.'});
+    if (!res.headersSent) return res.status(error?.status || 503).json({success: false, ok: false, error: error?.status ? messageOf(error) : 'Could not queue the signing request. Check object storage and encryption configuration.'});
   } finally {
     password = '';
     await Promise.all(localApiFiles.map(source => fsp.rm(source.path, {force: true}).catch(() => {})));
   }
 });
 
+async function buildApiCompletionResult(manifest, req) {
+  const result = {
+    appName: manifest.otaMetadata?.appName || manifest.settings?.bundleName || 'Signed app',
+    bundleId: manifest.otaMetadata?.bundleId || manifest.settings?.bundleId || '',
+    version: manifest.otaMetadata?.version || manifest.settings?.bundleVersion || '1.0',
+    signingTime: `${Math.max(1, Math.round((Number(manifest.completedAt || Date.now()) - Number(manifest.createdAt || Date.now())) / 1000))}s`
+  };
+  await expireSignedResultIfNeeded(manifest);
+  if (!manifest.resultKey) {
+    result.error = 'The signed IPA has expired or is unavailable.';
+    return result;
+  }
+  const expiresAt = Number(manifest.resultExpiresAt || (Number(manifest.completedAt || Date.now()) + SIGNED_IPA_RETENTION_MS));
+  const remainingSeconds = Math.floor((expiresAt - Date.now()) / 1000);
+  if (remainingSeconds < 1) {
+    result.error = 'The signed IPA has expired or is unavailable.';
+    return result;
+  }
+  try {
+    const downloadUrl = await getSignedUrl(getS3(), new GetObjectCommand({
+      Bucket: BUCKET, Key: manifest.resultKey,
+      ResponseContentDisposition: 'attachment; filename="signed.ipa"',
+      ResponseContentType: 'application/octet-stream'
+    }), {expiresIn: Math.max(1, Math.min(600, remainingSeconds))});
+    result.downloadUrl = downloadUrl;
+    result.download_url = downloadUrl;
+  } catch (error) {
+    console.warn('Discord API completion download URL failed:', messageOf(error));
+  }
+  if (!result.bundleId) {
+    result.otaError = 'Could not determine the app Bundle ID. Supply bundleId to enable OTA installation.';
+    return result;
+  }
+  try {
+    const installToken = crypto.randomBytes(32).toString('base64url');
+    manifest.otaTokenHash = hashToken(installToken).toString('hex');
+    manifest.otaExpiresAt = Math.min(Date.now() + 24 * 60 * 60 * 1000, expiresAt);
+    await putManifest(manifest);
+    const origin = (PUBLIC_ORIGIN || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '');
+    const manifestUrl = `${origin}/ota/${manifest.id}/${installToken}/manifest.plist`;
+    const installUrl = `itms-services://?action=download-manifest&url=${encodeURIComponent(manifestUrl)}`;
+    result.manifestUrl = manifestUrl;
+    result.installUrl = installUrl;
+    result.otaUrl = installUrl;
+    result.ota_url = installUrl;
+  } catch (error) {
+    console.warn('Discord API completion OTA URL failed:', messageOf(error));
+    result.otaError = 'Could not create the OTA installation link.';
+  }
+  return result;
+}
+
 app.get('/api/jobs/:id', pollLimiter, async (req, res) => {
   const manifest = await authorizedJob(req, res, req.params.id);
   if (!manifest) return;
   const after = Math.max(0, Number.parseInt(req.query.after || '0', 10) || 0);
-  res.set('Cache-Control', 'no-store').json({
-    id: manifest.id, status: manifest.status, phase: manifest.phase,
-    progress: Number(manifest.progress || 0), error: manifest.status === 'failed' ? manifest.error : null,
+  const logs = (manifest.logs || []).filter(entry => Number(entry.id) > after).slice(-120);
+  const response = {
+    success: true, ok: true, id: manifest.id, jobId: manifest.id, job_id: manifest.id,
+    status: manifest.status, phase: manifest.phase, stage: manifest.phase,
+    progress: Number(manifest.progress || 0), poll_after_ms: manifest.status === 'completed' || manifest.status === 'failed' ? 0 : 1000,
+    message: logs.length ? logs[logs.length - 1].message : (manifest.status === 'queued' ? 'Queued for zsign worker.' : 'Signing job is processing.'),
+    error: manifest.status === 'failed' ? manifest.error : null,
     resultSize: manifest.status === 'completed' ? manifest.resultSize : null,
     appName: manifest.otaMetadata?.appName || manifest.settings?.bundleName || null,
-    logSequence: Number(manifest.logSequence || 0),
-    logs: (manifest.logs || []).filter(entry => Number(entry.id) > after).slice(-120)
-  });
+    logSequence: Number(manifest.logSequence || 0), logs
+  };
+  if (manifest.status === 'completed' && manifest.source === 'api') {
+    response.signingTime = `${Math.max(1, Math.round((Number(manifest.completedAt || Date.now()) - Number(manifest.createdAt || Date.now())) / 1000))}s`;
+    response.result = await buildApiCompletionResult(manifest, req);
+  }
+  res.set('Cache-Control', 'no-store').json(response);
 });
 
 app.post('/api/jobs/:id/download-url', actionLimiter, async (req, res) => {
