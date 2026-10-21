@@ -25,6 +25,7 @@ COPY --from=zsign-build /src/LICENSE /usr/share/licenses/zsign/LICENSE
 COPY package.json ./
 RUN npm install --omit=dev && npm cache clean --force
 COPY server.js ./
+COPY lib ./lib
 COPY docs ./docs
 RUN mkdir -p /data/work && chmod 0777 /data /data/work
 ENV NODE_ENV=production

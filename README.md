@@ -8,11 +8,13 @@ This project runs an API-only Node.js service on Render. It does not serve a web
 - `GET /doc` — owner-IP-restricted HTML documentation page; `GET /doc/openapi.json` serves the equivalent OpenAPI JSON. Both use `OWNER_IP` (fallback `XSIGNER_OWNER_IP`, then `168.91.23.165`). The `/sign` API itself remains public and has no owner-IP restriction.
 - `GET /healthz` — Render runtime readiness probe; returns HTTP 200 only when zsign, Tigris configuration, and job encryption are available, otherwise HTTP 503. The Render service health check is configured to `/healthz`.
 - `GET /health` — backwards-compatible alias of `/healthz`.
+- `GET /healthz/dependencies` — cached deeper diagnostic probe that attempts a bounded zsign version check, Tigris bucket check, writable workspace check and Redis ping when shared queue mode is enabled. Returns 200 when ready or 503 when a dependency check fails; details intentionally expose booleans/status only, never credentials.
+- `GET /api/ops/metrics` — owner-IP-only operational snapshot with queue depth, active jobs, configured concurrency, process uptime, and informational scratch-disk availability. Structured Render logs also record queue wait, attempt duration, completed signing duration/result size, and stage/code for failures.
 - `GET /api/v1/discord/health` — compatibility health endpoint for the Discord bot; returns `status: ok` only when zsign, Tigris configuration, and `JOB_ENCRYPTION_KEY` are present, otherwise HTTP 503 with `status: degraded`.
-- `POST /sign` or `POST /api/v1/discord/sign` — submit a multipart signing request; public, no API key and no owner-IP restriction, with per-source-IP rate limiting.
+- `POST /sign` or `POST /api/v1/discord/sign` — submit a multipart signing request. By default the existing bot contract remains public and is rate-limited by source IP. Setting `API_CLIENTS_JSON` turns on per-bot `X-API-Key` authentication and per-client quotas; in that mode keys are required for submissions.
 - `GET /api/jobs/:jobId?after=0` — poll a job. Authenticate with `Authorization: Bearer <jobToken>`.
-- `POST /api/jobs/:jobId/download-url` — mint a signed download URL before the 10-minute result-retention deadline.
-- `POST /api/jobs/:jobId/ota-url` — mint a fresh iOS OTA link before the same deadline.
+- `POST /api/jobs/:jobId/download-url` — mint a signed download URL before the configured result-retention deadline; includes `expiresAt` (ISO-8601) and `expiresAtMs`.
+- `POST /api/jobs/:jobId/ota-url` — mint a fresh iOS OTA link before the same deadline; includes `expiresAt` and `expiresAtMs`.
 - `GET /ota/:jobId/:token/manifest.plist` — the iOS OTA manifest endpoint.
 
 Everything else except `/doc` and `/doc/openapi.json` returns JSON 404. The only HTML is the owner-IP-restricted API reference page; there is no browser signer UI, certificate browsing, or CAPTCHA requirement for Discord bot API requests.
@@ -58,9 +60,20 @@ A short initial response example (identifiers are placeholders):
 
 Poll with `Authorization: Bearer <jobToken>`. The server also supports the previous bot pattern that sends `Authorization: Bearer XSIGN_SECRET` on submission and reuses that bearer for the job it created, for backwards compatibility. New bot code should use the response's job-specific `jobToken` because it limits status/download access to that job.
 
-The completion response's `result` object includes the signed IPA URL (temporary), an OTA install URL when the Bundle ID is available, app metadata, and `signingTime`. iOS install links use the `itms-services` scheme; a bot may wrap that with the OTA landing-page service if its setup requires one.
+The completion response's `result` object includes the signed IPA URL (temporary), an OTA install URL when the Bundle ID is available, app metadata, `signingTime`, and `resultExpiresAt` (ISO-8601) plus `resultExpiresAtMs`. The poll response also exposes those expiry fields at the top level for convenience. Keep the result deadline in your bot and warn users before the link expires. iOS install links use the `itms-services` scheme; a bot may wrap that with the OTA landing-page service if its setup requires one.
 
-The built-in per-IP limit defaults to 30 submissions every 15 minutes (`API_SIGN_RATE_LIMIT`). Requests from a Discord bot deployment all share the bot host's egress IP, so tune this setting according to usage while preserving abuse protection. Submission does not require an API key or match the owner's IP. Status/result routes require a job token.
+By default, submissions keep the existing no-key bot contract and are limited to 30 requests per source IP every 15 minutes (`API_SIGN_RATE_LIMIT`). To enable optional per-bot authentication, set `API_CLIENTS_JSON` in Render's environment settings. Once it contains one or more clients, **all signing submissions must send `X-API-Key`**; missing or invalid keys receive HTTP 401. Each client gets a separate quota (default 120 requests per 15 minutes), while authenticated traffic also has a shared per-IP safety ceiling (default 300 per 15 minutes). Status/results still require the job token. The existing `Authorization: Bearer ...` compatibility behavior is kept separate from `X-API-Key`.
+
+Example `API_CLIENTS_JSON` value (replace both example keys with unique random secrets of at least 32 characters; do not commit real keys):
+
+```json
+{
+  "discord-production": {"key": "REPLACE_WITH_A_UNIQUE_RANDOM_SECRET_OF_32_PLUS_CHARS", "limit": 120, "windowMs": 900000},
+  "discord-staging": {"key": "USE_A_DIFFERENT_RANDOM_SECRET_OF_32_PLUS_CHARS", "limit": 20, "windowMs": 3600000}
+}
+```
+
+Each object uses `key` (required), `limit` (optional positive integer), and `windowMs` (optional 60000–86400000 milliseconds). The top-level names are client IDs made of letters, digits, dots, underscores, or hyphens. Use a separate random key for every bot. The optional helper accepts `apiKey: process.env.XSIGNER_API_KEY` and adds the `X-API-Key` header only when provided. Leave `API_CLIENTS_JSON` unset until your bot is configured with the matching key. In standalone mode, quota counters are process-local; with `REDIS_URL` configured, per-client fixed-window quotas use atomic Redis counters and are shared across API instances.
 
 ### Node.js 22 / discord.js request pattern
 
@@ -71,9 +84,19 @@ The built-in per-IP limit defaults to 30 submissions every 15 minutes (`API_SIGN
 - The service's signing engine is zsign from `zhlynn/zsign`, built into the container image.
 - Optional `.deb` inputs are extracted with `dpkg-deb`; `.dylib` files are passed to zsign for injection. An arbitrary `.deb` is not itself signed.
 - Optional PNG icon, app name, Bundle ID, and version override are forwarded to zsign. When not supplied, the service attempts to read metadata from the IPA.
-- Remote IPA downloads are streamed to a temporary file (not buffered whole in RAM), default cap 4 GiB and default timeout 60 minutes. A 401/403 from the source host means that host denied the request; choose a direct publicly accessible download URL or meet the file host's documented requirements. Each redirect is revalidated as public HTTPS to prevent SSRF through a redirect target.
+- Remote IPA downloads are streamed to a temporary file (not buffered whole in RAM), default cap 4 GiB and default timeout 60 minutes. DNS results are checked against conservative IPv4/IPv6 non-public/special-use ranges and pinned to the actual HTTPS connection to mitigate DNS rebinding. Every redirect is independently re-resolved, checked and pinned. A 401/403 from the source host means that host denied the request; choose a direct publicly accessible download URL or meet the file host's documented requirements.
 - Signing needs temporary local filesystem space for zsign's extraction, modifications, archive, and output. Tigris stores uploaded inputs and completed output, but does not substitute for the working directory required by zsign.
-- Signed IPA result objects are deleted from Tigris 10 minutes after completion (`SIGNED_IPA_TTL_MINUTES=10`). Signed download/OTA URLs expire no later than that deadline. Input objects and certificate material are deleted after success/failure.
+- Signed IPA result objects are deleted from Tigris after the configured `SIGNED_IPA_TTL_MINUTES` window (default 10 minutes, safely clamped to 1–60). Completion and URL responses expose exact expiration timestamps; signed download/OTA URLs cannot outlive that deadline. Input objects and certificate material are deleted after success/failure.
+
+## Error responses and request tracing
+
+All JSON responses include the server-generated `X-Request-ID` response header; JSON bodies also include `requestId`. JSON errors follow `{ "success": false, "ok": false, "error": "...", "code": "...", "requestId": "..." }` while retaining endpoint-specific extra fields. Stable error codes include `API_KEY_REQUIRED`, `API_CLIENT_RATE_LIMITED`, `IP_RATE_LIMITED`, `AUTHENTICATED_IP_RATE_LIMITED`, `PAYLOAD_TOO_LARGE`, `NOT_FOUND`, `RESULT_EXPIRED`, `SERVICE_UNAVAILABLE` and `INTERNAL_ERROR`. When reporting a problem, include the request ID, not the job token or API key.
+
+## Optional horizontal scaling with a shared queue
+
+The default `render.yaml` keeps the current single-service in-process queue, so it does not require Redis and remains compatible with your working bot. To run several API instances and separate signing workers, provision a private Render Key Value (Redis-compatible) instance and set the same `REDIS_URL` on every API/worker. Set `MANIFEST_STORAGE=s3` on all of them so Tigris is the authoritative shared job-manifest store. The application then uses BullMQ for durable cross-instance queueing, worker locks/stalled-job recovery, and Redis-backed per-client quotas. Configure the public API with `RUN_SIGNING_WORKER=false`; configure each background worker with `RUN_SIGNING_WORKER=true` and `DATA_DIR=/tmp/xsigner-worker`. Workers run the same Docker image but do not expose an HTTP listener. Share the exact same `AWS_*`, `S3_BUCKET`, `JOB_ENCRYPTION_KEY`, `REDIS_URL`, retention, and signing settings across every instance. Never rotate `JOB_ENCRYPTION_KEY` without accounting for queued manifests encrypted by the old key.
+
+See [`docs/SCALING.md`](docs/SCALING.md) before enabling this mode. It is opt-in and not activated merely by the default Blueprint; a separate Redis resource may incur additional Render charges. Do not enable horizontal scaling while job manifests still use local storage.
 
 ## Render and Tigris configuration
 

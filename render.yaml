@@ -25,6 +25,12 @@ services:
         value: "1"
       - key: API_SIGN_RATE_LIMIT
         value: "30"
+      - key: API_CLIENT_DEFAULT_LIMIT
+        value: "120"
+      - key: API_CLIENT_DEFAULT_WINDOW_MS
+        value: "900000"
+      - key: API_SIGN_AUTHENTICATED_IP_LIMIT
+        value: "300"
       - key: PART_SIZE_BYTES
         value: "67108864"
       - key: JOB_TTL_HOURS
