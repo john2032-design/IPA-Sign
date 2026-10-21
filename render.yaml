@@ -33,7 +33,7 @@ services:
         value: "2700000"
       - key: PUBLIC_ORIGIN
         value: https://xsigner.onrender.com
-      - key: XSIGNER_OWNER_IP
+      - key: OWNER_IP
         value: "168.91.23.165"
       - key: AWS_ENDPOINT_URL_S3
         value: https://t3.storage.dev

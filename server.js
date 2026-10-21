@@ -81,12 +81,13 @@ const apiSignStorage = {
 };
 const apiSignUpload = multer({
   storage: apiSignStorage,
-  limits: {fileSize: MAX_IPA_BYTES, files: 6, fields: 12, parts: 18, fieldNameSize: 64, fieldSize: 4096},
+  limits: {fileSize: MAX_IPA_BYTES, files: 8, fields: 12, parts: 24, fieldNameSize: 64, fieldSize: 4096},
   fileFilter(_req, file, callback) {
     const ext = path.extname(file.originalname || '').toLowerCase();
     const allowed = {
-      ipa: ['.ipa'], p12: ['.p12', '.pfx'], mobileprovision: ['.mobileprovision'],
-      icon: ['.png'], deb: ['.deb'], dylib: ['.dylib']
+      ipa: ['.ipa'], p12: ['.p12', '.pfx'], certificate: ['.p12', '.pfx'],
+      mobileprovision: ['.mobileprovision'], profile: ['.mobileprovision'],
+      icon: ['.png'], deb: ['.deb'], dylib: ['.dylib'], tweaks: ['.deb', '.dylib']
     };
     if (!allowed[file.fieldname] || !allowed[file.fieldname].includes(ext)) {
       return callback(Object.assign(new Error(`Invalid file type for ${file.fieldname}.`), {status: 400}));
@@ -94,8 +95,9 @@ const apiSignUpload = multer({
     callback(null, true);
   }
 }).fields([
-  {name: 'ipa', maxCount: 1}, {name: 'p12', maxCount: 1}, {name: 'mobileprovision', maxCount: 1},
-  {name: 'icon', maxCount: 1}, {name: 'deb', maxCount: 1}, {name: 'dylib', maxCount: 1}
+  {name: 'ipa', maxCount: 1}, {name: 'p12', maxCount: 1}, {name: 'certificate', maxCount: 1},
+  {name: 'mobileprovision', maxCount: 1}, {name: 'profile', maxCount: 1},
+  {name: 'icon', maxCount: 1}, {name: 'deb', maxCount: 1}, {name: 'dylib', maxCount: 1}, {name: 'tweaks', maxCount: 2}
 ]);
 
 await fsp.mkdir(WORK_ROOT, {recursive: true});
@@ -115,7 +117,7 @@ let s3Client;
 // Hot manifest cache: polling must not download manifest.json from object storage on every browser poll.
 // S3-compatible storage is durable; cached metadata is only process memory.
 const manifestCache = new Map();
-const OWNER_IP = process.env.XSIGNER_OWNER_IP || '168.91.23.165';
+const OWNER_IP = String(process.env.OWNER_IP || process.env.XSIGNER_OWNER_IP || '168.91.23.165').trim().replace(/^::ffff:/i, '').split('%')[0];
 function normalizedClientIp(req) { return String(req.ip || req.socket?.remoteAddress || '').replace(/^::ffff:/i, '').split('%')[0]; }
 function isOwnerRequest(req) { return normalizedClientIp(req) === OWNER_IP; }
 function storageConfigured() {
@@ -642,18 +644,21 @@ app.post('/api/jobs/:id/sign', actionLimiter, async (req, res) => {
   }
 });
 
+app.get('/api/v1/discord/health', (_req, res) => res.status(200).json({status: 'ok', service: 'xsigner', dependencies: {signing_engine: 'zsign', storage: storageConfigured() ? 'tigris' : 'unconfigured'}}));
+
 const publicSignLimiter = rateLimit({windowMs: 15 * 60_000, limit: 6, standardHeaders: 'draft-8', legacyHeaders: false, message: {error: 'Too many public signing requests from this IP. Retry later.'}});
-app.post('/sign', publicSignLimiter, apiSignUpload, async (req, res) => {
+app.post(['/sign', '/api/v1/discord/sign'], publicSignLimiter, apiSignUpload, async (req, res) => {
   const body = req.body || {};
   const files = req.files || {};
   const file = field => Array.isArray(files[field]) ? files[field][0] : null;
   const ipaFile = file('ipa');
-  const p12File = file('p12');
-  const profileFile = file('mobileprovision');
+  const p12File = file('p12') || file('certificate');
+  const profileFile = file('mobileprovision') || file('profile');
   const iconFile = file('icon');
-  const debFile = file('deb');
-  const dylibFile = file('dylib');
-  const localApiFiles = [ipaFile, p12File, profileFile, iconFile, debFile, dylibFile].filter(Boolean);
+  const legacyTweaks = Array.isArray(files.tweaks) ? files.tweaks : [];
+  const debFile = file('deb') || legacyTweaks.find(item => path.extname(item.originalname || '').toLowerCase() === '.deb') || null;
+  const dylibFile = file('dylib') || legacyTweaks.find(item => path.extname(item.originalname || '').toLowerCase() === '.dylib') || null;
+  const localApiFiles = Object.values(files).flat().filter(Boolean);
   let manifest = null;
   let password = '';
 
@@ -699,11 +704,10 @@ app.post('/sign', publicSignLimiter, apiSignUpload, async (req, res) => {
       appendJobLog(manifest, 'API request accepted. IPA will be fetched from the supplied public HTTPS URL.', 'system', password);
     }
     const uploadMap = [
-      ['p12', 'certificate'], ['mobileprovision', 'profile'], ['icon', 'icon'], ['deb', 'deb'], ['dylib', 'dylib'],
-      ...(!ipaUrl && ipaFile ? [['ipa', 'ipa']] : [])
+      [p12File, 'certificate'], [profileFile, 'profile'], [iconFile, 'icon'], [debFile, 'deb'], [dylibFile, 'dylib'],
+      ...(!ipaUrl && ipaFile ? [[ipaFile, 'ipa']] : [])
     ];
-    for (const [fieldName, kind] of uploadMap) {
-      const source = file(fieldName);
+    for (const [source, kind] of uploadMap) {
       if (!source) continue;
       const extension = path.extname(source.originalname).toLowerCase();
       const key = `uploads/${id}/${kind}${extension}`;
