@@ -5,7 +5,6 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import os from 'node:os';
 import dns from 'node:dns/promises';
 import net from 'node:net';
 import {spawn, execFile} from 'node:child_process';
@@ -14,8 +13,7 @@ import multer from 'multer';
 import {pipeline} from 'node:stream/promises';
 import {Transform, Readable} from 'node:stream';
 import {
-  S3Client, CreateMultipartUploadCommand, UploadPartCommand,
-  CompleteMultipartUploadCommand, AbortMultipartUploadCommand,
+  S3Client, AbortMultipartUploadCommand,
   PutObjectCommand, GetObjectCommand,
   DeleteObjectCommand, ListObjectsV2Command
 } from '@aws-sdk/client-s3';
@@ -44,10 +42,7 @@ const SIGNED_IPA_CLEANUP_INTERVAL_MS = Math.max(10_000, Number(process.env.SIGNE
 const MAX_CONCURRENT_JOBS = Math.max(1, Number(process.env.MAX_CONCURRENT_JOBS || 1));
 const PUBLIC_ORIGIN = process.env.PUBLIC_ORIGIN || '';
 const JOB_ENCRYPTION_KEY = process.env.JOB_ENCRYPTION_KEY || '';
-const RECAPTCHA_SECRET_KEY = process.env.RECAPTCHA_SECRET_KEY || '';
-const CERT_API_BASE = 'https://sideloading.net/api/certificates';
 const execFileAsync = promisify(execFile);
-const checkerUpload = multer({storage: multer.memoryStorage(), limits: {fileSize: 32 * 1024 * 1024, files: 2, fields: 3}}).fields([{name: 'p12', maxCount: 1}, {name: 'mobileprovision', maxCount: 1}]);
 const API_SIGN_FILE_LIMITS = {
   ipa: MAX_IPA_BYTES,
   p12: MAX_SMALL_FILE_BYTES,
@@ -116,47 +111,38 @@ await fsp.mkdir(MANIFEST_ROOT, {recursive: true, mode: 0o700});
 app.disable('x-powered-by');
 app.use(helmet({contentSecurityPolicy: false, crossOriginEmbedderPolicy: false}));
 app.use(express.json({limit: '1mb'}));
-app.use(express.static(path.join(process.cwd(), 'public'), {
-  maxAge: '1h', etag: true,
-  setHeaders(res, filePath) {
-    // Prevent a cached index.html from keeping the owner-only sidebar state stale after deploys.
-    if (path.basename(filePath).toLowerCase() === 'index.html') res.setHeader('Cache-Control', 'no-store, max-age=0');
-  }
-}));
-
-const createLimiter = rateLimit({windowMs: 60_000, limit: 8, standardHeaders: 'draft-8', legacyHeaders: false, message: {error: 'Too many jobs created. Try again in a minute.'}});
-const partLimiter = rateLimit({windowMs: 60_000, limit: 240, standardHeaders: 'draft-8', legacyHeaders: false, message: {error: 'Too many upload requests. Slow down and retry.'}});
-const actionLimiter = rateLimit({windowMs: 60_000, limit: 15, standardHeaders: 'draft-8', legacyHeaders: false, message: {error: 'Too many requests. Try again shortly.'}});
-const pollLimiter = rateLimit({windowMs: 60_000, limit: 180, standardHeaders: 'draft-8', legacyHeaders: false, message: {error: 'Too many status requests. Slow down briefly.'}});
+const actionLimiter = rateLimit({windowMs: 60_000, limit: 15, standardHeaders: 'draft-8', legacyHeaders: false, message: {success: false, ok: false, error: 'Too many requests. Try again shortly.'}});
+const pollLimiter = rateLimit({windowMs: 60_000, limit: 180, standardHeaders: 'draft-8', legacyHeaders: false, message: {success: false, ok: false, error: 'Too many status requests. Slow down briefly.'}});
 
 let s3Client;
-// Hot manifest cache: polling must not download manifest.json from object storage on every browser poll.
-// S3-compatible storage is durable; cached metadata is only process memory.
-const manifestCache = new Map();
 function normalizeIp(value) {
   let candidate = String(value ?? '').trim();
   if (!candidate || candidate.includes(',')) return '';
   candidate = candidate.replace(/^::ffff:/i, '').split('%')[0];
   return net.isIP(candidate) ? candidate.toLowerCase() : '';
 }
+// Documentation is private to the configured owner IP. The signing API remains public.
 const OWNER_IP = normalizeIp(process.env.OWNER_IP || process.env.XSIGNER_OWNER_IP || '168.91.23.165');
 function normalizedClientIp(req) {
-  // Public Render web services receive CF-Connecting-IP from Cloudflare. Render's current
-  // guidance describes it as overwritten by Cloudflare, unlike a caller-supplied leftmost
-  // X-Forwarded-For value. Do not trust X-Forwarded-For for this owner-only gate.
-  const cloudflareHeader = req.headers?.['cf-connecting-ip'];
-  if (cloudflareHeader !== undefined) return normalizeIp(Array.isArray(cloudflareHeader) ? '' : cloudflareHeader);
-  // Fail closed in production if the trusted edge header is absent. Local development can
-  // still test the route directly without a Cloudflare proxy.
+  // Render's public edge supplies CF-Connecting-IP. Do not trust caller-provided X-Forwarded-For.
+  const edgeHeader = req.headers?.['cf-connecting-ip'];
+  if (edgeHeader !== undefined) return normalizeIp(Array.isArray(edgeHeader) ? '' : edgeHeader);
+  // In production, fail closed if the edge header is absent; local development may use the socket.
   if (process.env.NODE_ENV !== 'production') return normalizeIp(req.socket?.remoteAddress || req.ip);
   return '';
 }
-function ownerIpDetectionSource(req) {
-  const value = req.headers?.['cf-connecting-ip'];
-  if (value !== undefined) return normalizeIp(Array.isArray(value) ? '' : value) ? 'cf-connecting-ip' : 'invalid-cf-connecting-ip';
-  return process.env.NODE_ENV !== 'production' ? 'local-socket-fallback' : 'missing-cf-connecting-ip';
+function isOwnerRequest(req) {
+  const clientIp = normalizedClientIp(req);
+  return Boolean(OWNER_IP && clientIp && clientIp === OWNER_IP);
 }
-function isOwnerRequest(req) { return Boolean(OWNER_IP && normalizedClientIp(req) && normalizedClientIp(req) === OWNER_IP); }
+function requireOwnerDocs(req, res, next) {
+  if (!isOwnerRequest(req)) return res.status(404).set('Cache-Control', 'private, no-store').type('text').send('Not found');
+  res.set('Cache-Control', 'private, no-store');
+  next();
+}
+// Hot manifest cache: polling must not download manifest.json from object storage on every browser poll.
+// S3-compatible storage is durable; cached metadata is only process memory.
+const manifestCache = new Map();
 function storageConfigured() {
   return Boolean(BUCKET && process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && ENDPOINT && REGION);
 }
@@ -295,12 +281,6 @@ async function authorizedJob(req, res, id) {
     return null;
   }
 }
-async function signPartUrl(upload, partNumber) {
-  return getSignedUrl(getS3(), new UploadPartCommand({
-    Bucket: BUCKET, Key: upload.key, UploadId: upload.uploadId, PartNumber: partNumber,
-    ContentLength: Math.min(PART_SIZE, upload.expectedSize - ((partNumber - 1) * PART_SIZE))
-  }), {expiresIn: 3600});
-}
 async function listManifestKeys() {
   // Local manifests are authoritative in local mode; do not list or download remote manifest history.
   const entries = await fsp.readdir(MANIFEST_ROOT, {withFileTypes: true});
@@ -355,18 +335,6 @@ async function cleanupInputs(manifest, abortOpen = true) {
   }
 }
 
-async function verifyGoogleCaptcha(captchaToken, req) {
-  if (!RECAPTCHA_SECRET_KEY) throw Object.assign(new Error('reCAPTCHA verification is not configured on the server. Add RECAPTCHA_SECRET_KEY in Render.'), {status: 503});
-  const verifyBody = new URLSearchParams({secret: RECAPTCHA_SECRET_KEY, response: captchaToken});
-  if (req.ip) verifyBody.set('remoteip', req.ip);
-  const captchaResponse = await fetch('https://www.google.com/recaptcha/api/siteverify', {method: 'POST', headers: {'content-type': 'application/x-www-form-urlencoded'}, body: verifyBody, signal: AbortSignal.timeout(10_000)});
-  const captcha = await captchaResponse.json();
-  const expectedHosts = (process.env.RECAPTCHA_ALLOWED_HOSTNAMES || req.hostname || 'xsigner.onrender.com').split(',').map(value => value.trim().toLowerCase()).filter(Boolean);
-  if (!captchaResponse.ok || captcha.success !== true || !expectedHosts.includes(String(captcha.hostname || '').toLowerCase())) {
-    console.warn('reCAPTCHA rejected a signing request:', JSON.stringify({success: captcha.success === true, hostname: captcha.hostname || null, errors: captcha['error-codes'] || []}));
-    throw Object.assign(new Error('reCAPTCHA verification failed or expired. Complete the checkbox again and retry.'), {status: 403});
-  }
-}
 function isPrivateAddress(address) {
   const family = net.isIP(address);
   if (family === 4) {
@@ -416,279 +384,138 @@ function makeRemoteUpload(kind, sourceUrl, requestedName = '') {
 }
 async function downloadRemoteToFile(rawUrl, destination, maxBytes, onProgress = () => {}) {
   let currentUrl = rawUrl;
+  const configuredTimeout = Number(process.env.REMOTE_FETCH_TIMEOUT_MS || 60 * 60 * 1000);
+  const timeoutMs = Number.isFinite(configuredTimeout) && configuredTimeout >= 60_000 ? configuredTimeout : 60 * 60 * 1000;
+  const userAgent = String(process.env.REMOTE_FETCH_USER_AGENT || 'xsigner-ipa-signer/2.1 (+https://xsigner.onrender.com)')
+    .replace(/[\r\n]/g, '').slice(0, 200);
+  const requestHeaders = {
+    'user-agent': userAgent,
+    'accept': 'application/octet-stream, application/zip, */*',
+    // Avoid transparent compression changing the byte count for multi-gigabyte ZIP files.
+    'accept-encoding': 'identity'
+  };
+  if (process.env.REMOTE_FETCH_REFERER) {
+    let referer;
+    try { referer = new URL(process.env.REMOTE_FETCH_REFERER); } catch { throw new Error('REMOTE_FETCH_REFERER must be a valid HTTPS URL.'); }
+    if (referer.protocol !== 'https:') throw new Error('REMOTE_FETCH_REFERER must be a valid HTTPS URL.');
+    requestHeaders.referer = referer.toString();
+  }
+
   for (let redirects = 0; redirects <= 5; redirects++) {
     currentUrl = await validatePublicHttpsUrl(currentUrl);
-    const response = await fetch(currentUrl, {redirect: 'manual', signal: AbortSignal.timeout(Number(process.env.REMOTE_FETCH_TIMEOUT_MS || 20 * 60 * 1000))});
+    const sourceHost = new URL(currentUrl).hostname;
+    const timeoutSignal = AbortSignal.timeout(timeoutMs);
+    let response;
+    try {
+      response = await fetch(currentUrl, {redirect: 'manual', headers: requestHeaders, signal: timeoutSignal});
+    } catch (error) {
+      if (error?.name === 'TimeoutError' || error?.name === 'AbortError' || timeoutSignal.aborted) {
+        throw new Error(`Remote IPA download from ${sourceHost} timed out after ${Math.round(timeoutMs / 60000)} minutes. Increase REMOTE_FETCH_TIMEOUT_MS or use a faster direct-download host.`);
+      }
+      throw new Error(`Could not connect to remote file host ${sourceHost}: ${messageOf(error)}`);
+    }
+
     if ([301,302,303,307,308].includes(response.status)) {
       const location = response.headers.get('location');
-      if (!location || redirects === 5) throw new Error('Remote file URL redirected too many times.');
+      await response.body?.cancel().catch(() => {});
+      if (!location || redirects === 5) throw new Error(`Remote file URL on ${sourceHost} redirected too many times.`);
       currentUrl = new URL(location, currentUrl).toString();
       continue;
     }
-    if (!response.ok || !response.body) throw new Error(`Remote file server returned HTTP ${response.status}.`);
-    const declared = Number(response.headers.get('content-length') || 0);
-    if (declared > maxBytes) throw new Error(`Remote ${path.extname(destination).slice(1).toUpperCase()} exceeds the allowed size.`);
+    if (response.status === 401 || response.status === 403) {
+      await response.body?.cancel().catch(() => {});
+      throw new Error(
+        `Remote file host ${sourceHost} refused the download (HTTP ${response.status}). This is a source-host access restriction, not the IPA size limit. Use a direct public HTTPS download URL that works without login, cookies, CAPTCHA, or hotlink authorization. If you control the host, allowlist xsigner or set REMOTE_FETCH_USER_AGENT / REMOTE_FETCH_REFERER to the host's documented requirements.`
+      );
+    }
+    if (!response.ok || !response.body) {
+      await response.body?.cancel().catch(() => {});
+      const hint = response.status === 404 ? ' Check that the link points to the actual IPA file and has not expired.' : '';
+      throw new Error(`Remote file host ${sourceHost} returned HTTP ${response.status}.${hint}`);
+    }
+
+    const contentLengthHeader = response.headers.get('content-length');
+    const parsedLength = contentLengthHeader ? Number(contentLengthHeader) : 0;
+    const declared = Number.isFinite(parsedLength) && parsedLength > 0 ? parsedLength : 0;
+    if (declared > maxBytes) {
+      await response.body?.cancel().catch(() => {});
+      throw new Error(`Remote IPA from ${sourceHost} is ${formatBytesSafe(declared)}, exceeding the configured ${formatBytesSafe(maxBytes)} IPA limit.`);
+    }
+
     let received = 0;
+    const partPath = `${destination}.part`;
+    await fsp.rm(partPath, {force: true}).catch(() => {});
     const counter = new Transform({transform(chunk, _encoding, callback) {
       received += chunk.length;
-      if (received > maxBytes) return callback(new Error('Remote file exceeded its allowed size while downloading.'));
+      if (received > maxBytes) return callback(new Error(`Remote IPA exceeded the configured ${formatBytesSafe(maxBytes)} limit while downloading.`));
       onProgress(received, declared || null);
       callback(null, chunk);
     }});
-    await pipeline(Readable.fromWeb(response.body), counter, fs.createWriteStream(destination, {flags: 'wx'}));
-    if (declared && received !== declared) throw new Error('Remote file download ended before the declared size was received.');
-    if (received < 1) throw new Error('Remote file was empty.');
-    return received;
+    try {
+      await pipeline(Readable.fromWeb(response.body), counter, fs.createWriteStream(partPath, {flags: 'wx', mode: 0o600}));
+      if (declared && received !== declared) throw new Error(`Remote file download from ${sourceHost} ended at ${formatBytesSafe(received)} of the declared ${formatBytesSafe(declared)}.`);
+      if (received < 1) throw new Error(`Remote file host ${sourceHost} returned an empty file.`);
+      await fsp.rename(partPath, destination);
+      return received;
+    } catch (error) {
+      await fsp.rm(partPath, {force: true}).catch(() => {});
+      if (timeoutSignal.aborted || error?.name === 'TimeoutError' || error?.name === 'AbortError') {
+        throw new Error(`Remote IPA download from ${sourceHost} timed out after ${Math.round(timeoutMs / 60000)} minutes (received ${formatBytesSafe(received)}). Increase REMOTE_FETCH_TIMEOUT_MS or use a faster direct-download host.`);
+      }
+      throw error;
+    }
   }
   throw new Error('Remote file URL could not be fetched.');
 }
-app.get('/health', (_req, res) => res.status(200).json({
-  ok: true,
-  service: 'xsigner',
-  signer: 'zsign',
-  signerPath: SIGNER,
-  signerPresent: fs.existsSync(SIGNER),
-  storageConfigured: storageConfigured(),
-  encryptionConfigured: Boolean(JOB_ENCRYPTION_KEY),
-  recaptchaConfigured: Boolean(RECAPTCHA_SECRET_KEY),
-  diskPath: ROOT
+app.get(['/healthz', '/health'], (_req, res) => {
+  const signerPresent = fs.existsSync(SIGNER);
+  const storageReady = storageConfigured();
+  const encryptionReady = Boolean(JOB_ENCRYPTION_KEY);
+  const ready = signerPresent && storageReady && encryptionReady;
+  return res.status(ready ? 200 : 503).json({
+    ok: ready,
+    status: ready ? 'ok' : 'degraded',
+    service: 'xsigner',
+    signer: 'zsign',
+    signerPresent,
+    storageConfigured: storageReady,
+    encryptionConfigured: encryptionReady
+  });
+});
+app.get('/', (_req, res) => res.set('Cache-Control', 'no-store').json({
+  service: 'xsigner-signing-api',
+  status: 'ok',
+  signingEngine: 'zsign',
+  documentation: '/doc (owner IP only)',
+  endpoints: {
+    sign: {method: 'POST', path: '/sign', contentType: 'multipart/form-data'},
+    discordCompatibility: {method: 'POST', path: '/api/v1/discord/sign'},
+    health: {method: 'GET', path: '/api/v1/discord/health'},
+    jobStatus: {method: 'GET', path: '/api/jobs/{jobId}?after=0'},
+    downloadUrl: {method: 'POST', path: '/api/jobs/{jobId}/download-url'},
+    otaUrl: {method: 'POST', path: '/api/jobs/{jobId}/ota-url'}
+  },
+  ipaInput: 'Upload ipa as a file OR supply ipaUrl as the only URL field. p12 and mobileprovision must be uploaded files.'
 }));
-app.get('/api/config', (req, res) => res.set('Cache-Control', 'private, no-store').json({
-  maxIpaBytes: MAX_IPA_BYTES,
-  maxSmallFileBytes: MAX_SMALL_FILE_BYTES,
-  partSizeBytes: PART_SIZE,
-  publicOrigin: PUBLIC_ORIGIN || null,
-  recaptchaSiteKey: '6Lfg6_gtAAAAAI9zK0Uvquy2dG2Qk7op92wVzXVH',
-  ownerApiVisible: isOwnerRequest(req),
-  ownerIpConfigured: Boolean(OWNER_IP),
-  ownerIpDetectionSource: ownerIpDetectionSource(req)
+app.get('/sign', (_req, res) => res.status(405).set('Allow', 'POST').json({
+  success: false, ok: false,
+  error: 'Signing requires POST /sign with multipart/form-data. Use ipa as a file or ipaUrl as the only URL field, plus p12/certificate and mobileprovision/profile files.'
 }));
 
-app.get('/api/owner/discord-api-docs', (req, res) => {
-  if (!isOwnerRequest(req)) return res.status(404).json({error: 'Not found.'});
-  const origin = (PUBLIC_ORIGIN || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '');
-  const example = [
-    `curl -X POST \\`,
-    `  -F 'ipaUrl=https://files.example.com/app.ipa' \\`,
-    `  -F 'p12=@certificate.p12' \\`,
-    `  -F 'mobileprovision=@profile.mobileprovision' \\`,
-    `  -F 'password=YOUR_P12_PASSWORD' \\`,
-    `  -F 'appName=Example App' \\`,
-    `  -F 'bundleId=com.example.app' \\`,
-    `  -F 'bundleVersion=1.0' \\`,
-    `  -F 'icon=@icon.png' \\`,
-    `  -F 'deb=@tweak.deb' \\`,
-    `  -F 'dylib=@tweak.dylib' \\`,
-    `  '${origin}/sign'`
-  ].join('\n');
-  res.set('Cache-Control', 'private, no-store').json({
-    title: 'Discord bot signing API', endpoint: `${origin}/sign`, method: 'POST',
-    contentType: 'multipart/form-data',
-    auth: 'No API key and no owner-IP restriction on /sign. The endpoint is public and rate-limited per source IP. Only ipaUrl can be a URL; all signing assets are uploaded as files.',
-    fields: [
-      {name:'ipa',type:'file',required:'Required unless ipaUrl is supplied',description:'Source .ipa file. Upload this file or use ipaUrl, but not both.'},
-      {name:'ipaUrl',type:'HTTPS URL',required:'Optional alternative to ipa file',description:'Public HTTPS URL for the source IPA. This is the only URL field accepted by /sign.'},
-      {name:'p12',type:'file',required:true,description:'Signing certificate file (.p12 or .pfx). This is a file upload, not a URL.'},
-      {name:'mobileprovision',type:'file',required:true,description:'Apple mobileprovision profile file. This is a file upload, not a URL.'},
-      {name:'password',type:'text',required:false,description:'P12 password; omit or use an empty string if unencrypted.'},
-      {name:'icon',type:'file',required:false,description:'Optional PNG icon file applied during signing.'},
-      {name:'deb',type:'file',required:false,description:'Optional .deb tweak package; contained .dylib files are extracted and injected.'},
-      {name:'dylib',type:'file',required:false,description:'Optional .dylib file to inject and re-sign. May be supplied alongside deb.'},
-      {name:'appName',type:'text',required:false,description:'Optional display-name override (also accepted as bundleName).'},
-      {name:'bundleId',type:'text',required:false,description:'Optional bundle ID override.'},
-      {name:'bundleVersion',type:'text',required:false,description:'Optional version override.'},
-      {name:'injectExtensions',type:'boolean',required:false,description:'Set to true to also inject tweaks into app extensions.'}
-    ],
-    example,
-    response: JSON.stringify({ok:true,jobId:'<job-uuid>',jobToken:'<bearer-token>',status:'queued',statusUrl:'/api/jobs/<job-uuid>?after=0',downloadUrlEndpoint:'/api/jobs/<job-uuid>/download-url',otaUrlEndpoint:'/api/jobs/<job-uuid>/ota-url'},null,2),
-    polling: `curl -H "Authorization: Bearer JOB_TOKEN" "${origin}/api/jobs/JOB_ID?after=0"`,
-    download: `curl -X POST -H "Authorization: Bearer JOB_TOKEN" -H "Content-Type: application/json" -d '{}' "${origin}/api/jobs/JOB_ID/download-url"`,
-    ota: `curl -X POST -H "Authorization: Bearer JOB_TOKEN" -H "Content-Type: application/json" -d '{}' "${origin}/api/jobs/JOB_ID/ota-url"`
+app.get('/api/v1/discord/health', (_req, res) => {
+  const signerPresent = fs.existsSync(SIGNER);
+  const storageReady = storageConfigured();
+  const encryptionReady = Boolean(JOB_ENCRYPTION_KEY);
+  const ready = signerPresent && storageReady && encryptionReady;
+  return res.status(ready ? 200 : 503).json({
+    status: ready ? 'ok' : 'degraded', service: 'xsigner',
+    dependencies: {signing_engine: signerPresent ? 'zsign' : 'missing', storage: storageReady ? 'tigris-configured' : 'unconfigured', job_encryption: encryptionReady ? 'configured' : 'unconfigured'},
+    ...(ready ? {} : {error: 'Signing service is not fully configured. Check zsign, Tigris environment variables, and JOB_ENCRYPTION_KEY.'})
   });
 });
 
-app.post('/api/jobs', createLimiter, async (req, res) => {
-  if (!storageConfigured()) return res.status(503).json({error: 'Tigris storage is not configured. Add the required AWS/S3 environment variables in Render.'});
-  if (!JOB_ENCRYPTION_KEY) return res.status(503).json({error: 'The job encryption key is not configured in Render.'});
-  const provided = req.body?.files;
-  if (!provided || typeof provided !== 'object') return res.status(400).json({error: 'File metadata is required.'});
-  const captchaToken = typeof req.body?.captchaToken === 'string' ? req.body.captchaToken.trim() : '';
-  if (!captchaToken) return res.status(400).json({error: 'Complete reCAPTCHA before uploading files.'});
-  try {
-    // Verify Google's single-use token immediately before creating this job. This avoids
-    // a separate in-memory pass that could be lost on restarts or fail on proxy-IP normalization.
-    await verifyGoogleCaptcha(captchaToken, req);
-  } catch (error) {
-    return res.status(error.status || 503).json({error: error.status ? messageOf(error) : 'Google reCAPTCHA is temporarily unavailable. Please retry.'});
-  }
-  const ipaUrlRaw = clampText(req.body?.ipaUrl || req.body?.ipa_url || req.body?.urls?.ipa, 4096);
-  let remoteIpaUrl = '';
-  if (ipaUrlRaw) { try { remoteIpaUrl = await validatePublicHttpsUrl(ipaUrlRaw); } catch (error) { return res.status(400).json({error: `Invalid IPA URL: ${messageOf(error)}`}); } }
-  const specs = {
-    ipa: {ext: '.ipa', max: MAX_IPA_BYTES, required: true},
-    certificate: {exts: ['.p12', '.pfx'], max: MAX_SMALL_FILE_BYTES, required: true},
-    profile: {ext: '.mobileprovision', max: MAX_SMALL_FILE_BYTES, required: true},
-    icon: {ext: '.png', max: MAX_SMALL_FILE_BYTES, required: false},
-    dylib: {ext: '.dylib', max: 128 * 1024 * 1024, required: false},
-    deb: {ext: '.deb', max: 256 * 1024 * 1024, required: false}
-  };
-  const normalized = {};
-  for (const kind of Object.keys(specs)) {
-    const item = provided[kind];
-    if ((!item || typeof item !== 'object') && kind === 'ipa' && remoteIpaUrl) {
-      normalized[kind] = {name: remoteFilename(remoteIpaUrl, 'ipa'), size: null, contentType: 'application/octet-stream', sourceUrl: remoteIpaUrl};
-      continue;
-    }
-    if (!item || typeof item !== 'object') {
-      if (specs[kind].required) return res.status(400).json({error: `Missing ${kind} file${kind === 'ipa' ? ' or public HTTPS IPA URL' : ''}.`});
-      continue;
-    }
-    const name = clampText(item.name, 240);
-    const size = Number(item.size);
-    if (!name || !Number.isSafeInteger(size) || size < 1 || size > specs[kind].max) {
-      return res.status(413).json({error: `${kind} file is empty or exceeds the allowed size.`});
-    }
-    const ext = path.extname(name).toLowerCase();
-    const validExt = specs[kind].ext ? ext === specs[kind].ext : specs[kind].exts.includes(ext);
-    if (!validExt) return res.status(400).json({error: `Invalid ${kind} file type.`});
-    normalized[kind] = {name, size, contentType: clampText(item.type, 120) || 'application/octet-stream'};
-  }
-  const id = newId();
-  const token = crypto.randomBytes(32).toString('base64url');
-  const manifest = {
-    id, tokenHash: hashToken(token).toString('hex'), source: 'web', captchaVerifiedAt: Date.now(),
-    status: 'creating_uploads', phase: 'preparing', progress: 0,
-    createdAt: Date.now(), updatedAt: Date.now(),
-    uploads: {}, settings: null, passwordCipher: null,
-    resultKey: null, resultSize: null, error: null, logs: [], logSequence: 0,
-    otaTokenHash: null, otaExpiresAt: null, otaMetadata: null
-  };
-  try {
-    for (const kind of Object.keys(specs)) {
-      const metadata = normalized[kind];
-      // Optional uploads (icon, dylib, deb) are absent unless selected.
-      // Do not attempt to create a multipart upload for a missing file.
-      if (!metadata) continue;
-      if (metadata.sourceUrl) {
-        manifest.uploads[kind] = makeRemoteUpload(kind, metadata.sourceUrl, metadata.name);
-        continue;
-      }
-      const key = `uploads/${id}/${kind}${path.extname(metadata.name).toLowerCase()}`;
-      const result = await getS3().send(new CreateMultipartUploadCommand({
-        Bucket: BUCKET, Key: key, ContentType: metadata.contentType,
-        Metadata: {jobid: id, kind}
-      }));
-      manifest.uploads[kind] = {
-        key, uploadId: result.UploadId, filename: metadata.name,
-        contentType: metadata.contentType, expectedSize: metadata.size,
-        partCount: Math.ceil(metadata.size / PART_SIZE), completed: false, actualSize: null
-      };
-    }
-    manifest.status = 'uploading';
-    manifest.phase = 'uploading';
-    await putManifest(manifest);
-    res.status(201).json({jobId: id, jobToken: token, partSizeBytes: PART_SIZE, files: Object.fromEntries(Object.entries(manifest.uploads).map(([kind, value]) => [kind, {partCount: value.partCount, size: value.expectedSize}]))});
-  } catch (error) {
-    await cleanupInputs(manifest).catch(() => {});
-    await fsp.rm(localManifestPath(id), {force: true}).catch(() => {});
-    manifestCache.delete(id);
-    console.error('job creation failed:', JSON.stringify({
-      message: messageOf(error),
-      name: error?.name || null,
-      code: error?.Code || error?.code || null,
-      httpStatusCode: error?.$metadata?.httpStatusCode || null,
-      requestId: error?.$metadata?.requestId || null
-    }));
-    res.status(503).json({error: `Could not start a Tigris upload. Check the bucket, credentials, and permissions. (${messageOf(error)})`});
-  }
-});
-
-app.post('/api/jobs/:id/part-urls', partLimiter, async (req, res) => {
-  const manifest = await authorizedJob(req, res, req.params.id);
-  if (!manifest) return;
-  const kind = req.body?.kind;
-  const upload = manifest.uploads?.[kind];
-  const partNumbers = req.body?.partNumbers;
-  if (!upload || upload.completed || manifest.status !== 'uploading') return res.status(409).json({error: 'This file is not awaiting upload.'});
-  if (!Array.isArray(partNumbers) || partNumbers.length < 1 || partNumbers.length > 16) return res.status(400).json({error: 'Request between 1 and 16 part numbers at a time.'});
-  const nums = [...new Set(partNumbers.map(Number))];
-  if (nums.length !== partNumbers.length || nums.some(n => !Number.isInteger(n) || n < 1 || n > upload.partCount)) return res.status(400).json({error: 'Invalid multipart part numbers.'});
-  try {
-    const urls = await Promise.all(nums.map(async partNumber => ({partNumber, url: await signPartUrl(upload, partNumber)})));
-    res.set('Cache-Control', 'no-store').json({urls});
-  } catch (error) {
-    console.error('presign part failed:', messageOf(error));
-    res.status(503).json({error: 'Could not authorize this upload part.'});
-  }
-});
-
-app.post('/api/jobs/:id/complete-upload', partLimiter, async (req, res) => {
-  const manifest = await authorizedJob(req, res, req.params.id);
-  if (!manifest) return;
-  const kind = req.body?.kind;
-  const upload = manifest.uploads?.[kind];
-  const parts = req.body?.parts;
-  if (!upload || upload.completed || manifest.status !== 'uploading') return res.status(409).json({error: 'This file is not awaiting completion.'});
-  if (!Array.isArray(parts) || parts.length !== upload.partCount) return res.status(400).json({error: 'The uploaded part list is incomplete.'});
-  const normalized = [];
-  for (let i = 0; i < parts.length; i++) {
-    const partNumber = Number(parts[i]?.partNumber);
-    const rawEtag = String(parts[i]?.etag || '');
-    if (partNumber !== i + 1 || !/^"?[a-fA-F0-9-]+"?$/.test(rawEtag)) return res.status(400).json({error: 'Multipart part list is invalid.'});
-    normalized.push({PartNumber: partNumber, ETag: rawEtag.startsWith('"') ? rawEtag : `"${rawEtag}"`});
-  }
-  try {
-    await getS3().send(new CompleteMultipartUploadCommand({
-      Bucket: BUCKET, Key: upload.key, UploadId: upload.uploadId,
-      MultipartUpload: {Parts: normalized}
-    }));
-    // Presigned part URLs bind each part's Content-Length; avoid an additional Class B HEAD read.
-    upload.completed = true;
-    upload.actualSize = upload.expectedSize;
-    upload.uploadId = null;
-    const allComplete = Object.values(manifest.uploads).every(value => value.completed);
-    if (allComplete) { manifest.status = 'ready'; manifest.phase = 'ready_to_sign'; manifest.progress = 64; }
-    await putManifest(manifest);
-    res.json({ok: true, kind, completed: true, allComplete});
-  } catch (error) {
-    console.error('complete upload failed:', messageOf(error));
-    res.status(400).json({error: 'Tigris could not finalize this upload. Retry or start the upload again.'});
-  }
-});
-
-app.post('/api/jobs/:id/sign', actionLimiter, async (req, res) => {
-  const manifest = await authorizedJob(req, res, req.params.id);
-  if (!manifest) return;
-  if (manifest.status !== 'ready' || !['ipa', 'certificate', 'profile'].every(kind => manifest.uploads?.[kind]?.completed)) {
-    return res.status(409).json({error: 'Upload the IPA, P12, and mobileprovision before signing.'});
-  }
-  // Website requests must pass server-verified CAPTCHA before any upload begins.
-  // /sign is a separately rate-limited public bot endpoint; it accepts uploaded assets and an optional IPA URL.
-  if (manifest.source !== 'api' && !manifest.captchaVerifiedAt) return res.status(403).json({error: 'Complete reCAPTCHA before signing.'});
-  const password = typeof req.body?.password === 'string' ? req.body.password : '';
-  if (password.length > 2048) return res.status(400).json({error: 'P12 password is too long.'});
-  const bundleId = clampText(req.body?.bundleId, 200);
-  if (bundleId && !/^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/.test(bundleId)) return res.status(400).json({error: 'Bundle ID format is invalid.'});
-  const bundleName = clampText(req.body?.bundleName, 200);
-  const bundleVersion = clampText(req.body?.bundleVersion, 100);
-  if (bundleVersion && !/^[A-Za-z0-9._+-]+$/.test(bundleVersion)) return res.status(400).json({error: 'Version format is invalid.'});
-  try {
-    manifest.settings = {bundleId, bundleName, bundleVersion, injectExtensions: req.body?.injectExtensions === true};
-    manifest.passwordCipher = encryptPassword(password);
-    manifest.status = 'queued'; manifest.phase = 'queued'; manifest.progress = 64; manifest.error = null;
-    appendJobLog(manifest, 'Job queued. Waiting for a zsign worker.', 'system', password);
-    await flushManifest(manifest);
-    enqueue(manifest.id);
-    res.status(202).json({ok: true, jobId: manifest.id, status: 'queued'});
-  } catch (error) {
-    console.error('could not queue signing:', messageOf(error));
-    res.status(503).json({error: 'Could not queue this signing job. Check the server encryption key and storage.'});
-  }
-});
-
-app.get('/api/v1/discord/health', (_req, res) => res.status(200).json({status: 'ok', service: 'xsigner', dependencies: {signing_engine: 'zsign', storage: storageConfigured() ? 'tigris' : 'unconfigured'}}));
-
-const publicSignLimiter = rateLimit({windowMs: 15 * 60_000, limit: 6, standardHeaders: 'draft-8', legacyHeaders: false, message: {error: 'Too many public signing requests from this IP. Retry later.'}});
+const API_SIGN_RATE_LIMIT = Math.max(1, Number(process.env.API_SIGN_RATE_LIMIT || 30));
+const publicSignLimiter = rateLimit({windowMs: 15 * 60_000, limit: API_SIGN_RATE_LIMIT, standardHeaders: 'draft-8', legacyHeaders: false, message: {success: false, ok: false, error: 'Too many signing requests from this source IP. Retry later.'}});
 app.post(['/sign', '/api/v1/discord/sign'], publicSignLimiter, handleApiSignUpload, async (req, res) => {
   const body = req.body || {};
   const files = req.files || {};
@@ -708,14 +535,14 @@ app.post(['/sign', '/api/v1/discord/sign'], publicSignLimiter, handleApiSignUplo
     if (!storageConfigured()) return res.status(503).json({success: false, ok: false, error: 'Tigris storage is not configured.'});
     if (!JOB_ENCRYPTION_KEY) return res.status(503).json({success: false, ok: false, error: 'Signing job encryption is not configured.'});
 
-    const rawIpaUrl = clampText(body.ipaUrl, 4096);
+    const rawIpaUrl = clampText(body.ipaUrl || body.ipa_url, 4096);
     // ipaUrl is the only URL accepted for source material. Certificates and profiles must be uploaded files.
     if (body.p12Url || body.p12_url || body.certificateUrl || body.mobileprovisionUrl || body.mobileprovision_url || body.profileUrl || body.profile_url) {
       return res.status(400).json({success: false, ok: false, error: 'Only ipaUrl may be provided as a URL. Upload p12 and mobileprovision as files.'});
     }
     if (ipaFile && rawIpaUrl) return res.status(400).json({success: false, ok: false, error: 'Provide either the ipa file or ipaUrl, not both.'});
     if (!ipaFile && !rawIpaUrl) return res.status(400).json({success: false, ok: false, error: 'Provide an ipa file or ipaUrl.'});
-    if (!p12File || !profileFile) return res.status(400).json({success: false, ok: false, error: 'Upload required files using the p12 and mobileprovision fields.'});
+    if (!p12File || !profileFile) return res.status(400).json({success: false, ok: false, error: 'Upload the signing certificate as p12/certificate and the profile as mobileprovision/profile files.'});
 
     let ipaUrl = '';
     if (rawIpaUrl) {
@@ -729,16 +556,20 @@ app.post(['/sign', '/api/v1/discord/sign'], publicSignLimiter, handleApiSignUplo
     const bundleName = clampText(body.appName || body.app_name || body.bundleName || body.bundle_name, 200);
     const bundleVersion = clampText(body.bundleVersion || body.bundle_version || body.version, 100);
     if (bundleVersion && !/^[A-Za-z0-9._+-]+$/.test(bundleVersion)) return res.status(400).json({success: false, ok: false, error: 'Version format is invalid.'});
+    const requestedSigner = clampText(body.signer, 32).toLowerCase();
+    if (requestedSigner && requestedSigner !== 'zsign') {
+      return res.status(400).json({success: false, ok: false, error: 'This API runs zsign only. Select signer=zsign or omit the signer field.'});
+    }
     const injectExtensions = body.injectExtensions === true || ['true', '1', 'yes'].includes(String(body.injectExtensions || '').trim().toLowerCase());
 
     const id = newId();
     const token = crypto.randomBytes(32).toString('base64url');
     const requestBearerMatch = /^Bearer\s+(.+)$/i.exec(String(req.headers.authorization || ''));
     const optionalCallerBearer = requestBearerMatch ? requestBearerMatch[1].trim() : '';
-    // Public submission remains unauthenticated. If the caller sends a private bearer (as
-    // the provided Discord bot does), hash it onto this job for backward-compatible polling.
-    // New clients should use the returned jobToken instead.
-    const clientPollTokenHash = optionalCallerBearer.length >= 16 ? hashToken(optionalCallerBearer).toString('hex') : null;
+    // Public submission remains unauthenticated. If the provided Discord bot sends its
+    // existing bearer, hash it onto this job for backward-compatible polling. This hash is
+    // scoped to this one job; new clients should prefer the returned jobToken.
+    const clientPollTokenHash = optionalCallerBearer.length > 0 ? hashToken(optionalCallerBearer).toString('hex') : null;
     manifest = {
       id, tokenHash: hashToken(token).toString('hex'), clientPollTokenHash, source: 'api', status: 'creating_uploads', phase: 'preparing', progress: 0,
       createdAt: Date.now(), updatedAt: Date.now(), uploads: {},
@@ -1409,97 +1240,16 @@ async function cleanupExpiredJobs() {
   }
 }
 
-// Public NexCerts index proxy. This keeps browser pages on the same origin and
-// does not store certificate files or passwords locally on this server.
-const listCertificatesHandler = async (req, res) => {
-  const allowed = new Set(['all', 'signed', 'revoked', 'missingP12']);
-  const status = req.params.status;
-  if (!allowed.has(status)) return res.status(400).json({error: 'Status must be all, signed, revoked, or missingP12.'});
-  let amount = '';
-  if (req.params.amount !== undefined) {
-    const count = Number(req.params.amount);
-    if (!Number.isInteger(count) || count < 1 || count > 500) return res.status(400).json({error: 'Amount must be an integer from 1 to 500.'});
-    amount = `/${count}`;
-  }
-  try {
-    const upstream = await fetch(`${CERT_API_BASE}/list/${status}${amount}`, {headers: {accept: 'application/json'}, signal: AbortSignal.timeout(20_000)});
-    const body = await upstream.text();
-    res.status(upstream.status).set('Cache-Control', 'public, max-age=60').type('application/json').send(body);
-  } catch (error) {
-    console.error('NexCerts list proxy failed:', messageOf(error));
-    res.status(502).json({error: 'Could not retrieve the certificate list from NexCerts.'});
-  }
-};
-app.get('/api/free-certificates/list/:status', actionLimiter, listCertificatesHandler);
-app.get('/api/free-certificates/list/:status/:amount', actionLimiter, listCertificatesHandler);
+// The API remains public, while the reference material stays owner-IP-only.
+const docsRoot = path.join(process.cwd(), 'docs');
+app.get(['/doc', '/doc/'], requireOwnerDocs, (_req, res) => res.sendFile(path.join(docsRoot, 'index.html')));
+app.get('/doc/openapi.json', requireOwnerDocs, (_req, res) => res.type('application/json').sendFile(path.join(docsRoot, 'openapi.json')));
 
-app.get('/api/free-certificates/download/all.zip', actionLimiter, async (_req, res) => {
-  await proxyCertificateDownload('all.zip', null, null, res);
-});
-app.get('/api/free-certificates/download/missingP12/:id/:file', actionLimiter, async (req, res) => {
-  const id = req.params.id;
-  const file = req.params.file;
-  if (!/^\d+$/.test(id) || !['cert.zip', 'cert.mobileprovision'].includes(file)) return res.status(400).json({error: 'Invalid missing-P12 download request.'});
-  await proxyCertificateDownload(id, file, 'missingP12', res);
-});
-app.get('/api/free-certificates/download/:id/:file', actionLimiter, async (req, res) => {
-  const {id, file} = req.params;
-  if (!/^\d+$/.test(id) || !['cert.zip', 'cert.p12', 'cert.mobileprovision', 'password.txt', 'password'].includes(file)) return res.status(400).json({error: 'Invalid certificate download request.'});
-  await proxyCertificateDownload(id, file, null, res);
-});
-async function proxyCertificateDownload(idOrAll, file, status, res) {
-  try {
-    let url;
-    if (idOrAll === 'all.zip') url = `${CERT_API_BASE}/download/all.zip`;
-    else if (status === 'missingP12') url = `${CERT_API_BASE}/download/missingP12/${encodeURIComponent(idOrAll)}/${encodeURIComponent(file)}`;
-    else url = `${CERT_API_BASE}/download/${encodeURIComponent(idOrAll)}/${encodeURIComponent(file)}`;
-    const upstream = await fetch(url, {redirect: 'follow', signal: AbortSignal.timeout(90_000)});
-    if (!upstream.ok) {
-      const body = await upstream.text();
-      return res.status(upstream.status).type('application/json').send(body || JSON.stringify({error: 'Certificate file is not available.'}));
-    }
-    const contentType = upstream.headers.get('content-type') || (file === 'password' ? 'text/plain; charset=utf-8' : 'application/octet-stream');
-    res.set('Content-Type', contentType).set('Cache-Control', 'no-store');
-    const downloadName = file === 'password' ? `certificate-${idOrAll}-password.txt` : file || 'all-certs.zip';
-    if (!contentType.includes('application/json')) res.set('Content-Disposition', `attachment; filename="${downloadName.replace(/[^a-zA-Z0-9._-]/g, '_')}"`);
-    if (!upstream.body) return res.status(502).end();
-    const reader = upstream.body.getReader();
-    while (true) {
-      const {done, value} = await reader.read();
-      if (done) break;
-      if (!res.write(Buffer.from(value))) await new Promise(resolve => res.once('drain', resolve));
-    }
-    res.end();
-  } catch (error) {
-    console.error('NexCerts download proxy failed:', messageOf(error));
-    if (!res.headersSent) res.status(502).json({error: 'Could not download the certificate file from NexCerts.'});
-    else res.end();
-  }
-}
-
-app.post('/api/certchecker/checkCert', actionLimiter, (req, res, next) => {
-  checkerUpload(req, res, error => error ? next(error) : next());
-}, async (req, res) => {
-  const p12 = req.files?.p12?.[0];
-  const mobileprovision = req.files?.mobileprovision?.[0];
-  const password = typeof req.body?.password === 'string' ? req.body.password : '';
-  if (!p12 && !mobileprovision) return res.status(400).json({error: 'Upload a P12 certificate, a mobileprovision file, or both.'});
-  if (p12 && !password) return res.status(400).json({error: 'P12 password is required when a P12 certificate is provided.'});
-  try {
-    const form = new FormData();
-    if (p12) form.append('p12', new Blob([p12.buffer], {type: p12.mimetype || 'application/x-pkcs12'}), path.basename(p12.originalname || 'certificate.p12'));
-    if (mobileprovision) form.append('mobileprovision', new Blob([mobileprovision.buffer], {type: mobileprovision.mimetype || 'application/octet-stream'}), path.basename(mobileprovision.originalname || 'profile.mobileprovision'));
-    if (p12) form.append('password', password);
-    const upstream = await fetch('https://sideloading.net/api/certchecker/checkCert', {method: 'POST', body: form, signal: AbortSignal.timeout(90_000)});
-    const body = await upstream.text();
-    res.status(upstream.status).set('Cache-Control', 'no-store').type('application/json').send(body);
-  } catch (error) {
-    console.error('NexCerts certificate check failed:', messageOf(error));
-    res.status(502).json({error: 'Certificate checking service is unavailable. Please retry.'});
-  } finally {
-    if (req.body) req.body.password = '';
-  }
-});
+// API-only: do not serve website tools, certificate browsing, or browser-only routes.
+app.use((req, res) => res.status(404).set('Cache-Control', 'no-store').json({
+  success: false, ok: false, error: 'API endpoint not found.',
+  signEndpoint: 'POST /sign', discordEndpoint: 'POST /api/v1/discord/sign'
+}));
 
 app.use((error, _req, res, _next) => {
   console.error('request failed:', messageOf(error));

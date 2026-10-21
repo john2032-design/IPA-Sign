@@ -6,7 +6,7 @@ services:
     plan: standard
     dockerfilePath: ./Dockerfile
     dockerContext: .
-    healthCheckPath: /health
+    healthCheckPath: /healthz
     autoDeploy: true
     disk:
       name: xsigner-work
@@ -23,6 +23,8 @@ services:
         value: "4294967296"
       - key: MAX_CONCURRENT_JOBS
         value: "1"
+      - key: API_SIGN_RATE_LIMIT
+        value: "30"
       - key: PART_SIZE_BYTES
         value: "67108864"
       - key: JOB_TTL_HOURS
@@ -30,11 +32,13 @@ services:
       - key: UPLOAD_TTL_HOURS
         value: "6"
       - key: SIGN_TIMEOUT_MS
-        value: "2700000"
+        value: "3600000"
+      - key: REMOTE_FETCH_TIMEOUT_MS
+        value: "3600000"
       - key: PUBLIC_ORIGIN
         value: https://xsigner.onrender.com
       - key: OWNER_IP
-        value: "168.91.23.165"
+        value: 168.91.23.165
       - key: AWS_ENDPOINT_URL_S3
         value: https://t3.storage.dev
       - key: AWS_ENDPOINT_URL_IAM
@@ -57,7 +61,3 @@ services:
         sync: false
       - key: JOB_ENCRYPTION_KEY
         generateValue: true
-      - key: RECAPTCHA_SECRET_KEY
-        sync: false
-      - key: RECAPTCHA_ALLOWED_HOSTNAMES
-        value: xsigner.onrender.com
