@@ -1,0 +1,991 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "xsigner IPA Signing API",
+    "version": "2.0.1",
+    "description": "Async IPA signing via zsign and Tigris object storage. Documentation is owner-IP-only; /sign is public and rate-limited. Upload ipa or pass ipaUrl; p12 and mobileprovision are always files."
+  },
+  "servers": [
+    {
+      "url": "https://xsigner.onrender.com"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Signing"
+    },
+    {
+      "name": "Results"
+    },
+    {
+      "name": "Health"
+    }
+  ],
+  "paths": {
+    "/healthz": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "summary": "Render health check (alias of /health)",
+        "responses": {
+          "200": {
+            "description": "Required runtime configuration exists."
+          },
+          "503": {
+            "description": "Required dependency missing."
+          }
+        }
+      }
+    },
+    "/sign": {
+      "post": {
+        "tags": [
+          "Signing"
+        ],
+        "summary": "Submit an IPA signing job",
+        "description": "Public submission with no API key or owner-IP restriction. Default limit: 30 submissions per source IP per 15 minutes. Alias: /api/v1/discord/sign.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "ipa": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "IPA file, mutually exclusive with ipaUrl; 4 GiB default limit."
+                  },
+                  "ipaUrl": {
+                    "type": "string",
+                    "format": "uri",
+                    "description": "Public direct HTTPS URL for IPA; the only URL-valued input."
+                  },
+                  "p12": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Required .p12/.pfx certificate file; alias certificate."
+                  },
+                  "certificate": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Legacy alias for p12."
+                  },
+                  "mobileprovision": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Required mobileprovision file; alias profile."
+                  },
+                  "profile": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Legacy alias for mobileprovision."
+                  },
+                  "password": {
+                    "type": "string",
+                    "description": "P12 password; blank if unencrypted."
+                  },
+                  "icon": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Optional PNG app icon."
+                  },
+                  "deb": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Optional .deb tweak bundle."
+                  },
+                  "dylib": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Optional .dylib injection."
+                  },
+                  "tweaks": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "format": "binary"
+                    },
+                    "description": "Legacy bot alias for up to two .deb/.dylib files."
+                  },
+                  "appName": {
+                    "type": "string",
+                    "maxLength": 200
+                  },
+                  "app_name": {
+                    "type": "string",
+                    "description": "Alias for appName."
+                  },
+                  "bundleName": {
+                    "type": "string",
+                    "description": "Alias for appName."
+                  },
+                  "bundleId": {
+                    "type": "string",
+                    "maxLength": 200
+                  },
+                  "bundle_id": {
+                    "type": "string",
+                    "description": "Alias for bundleId."
+                  },
+                  "bundleVersion": {
+                    "type": "string",
+                    "maxLength": 100
+                  },
+                  "bundle_version": {
+                    "type": "string",
+                    "description": "Alias for bundleVersion."
+                  },
+                  "version": {
+                    "type": "string",
+                    "description": "Alias for bundleVersion."
+                  },
+                  "injectExtensions": {
+                    "type": "boolean",
+                    "description": "Also inject dylibs into app extensions."
+                  },
+                  "signer": {
+                    "type": "string",
+                    "enum": [
+                      "zsign"
+                    ],
+                    "default": "zsign"
+                  }
+                },
+                "oneOf": [
+                  {
+                    "required": [
+                      "ipa"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "ipaUrl"
+                    ]
+                  }
+                ],
+                "anyOf": [
+                  {
+                    "required": [
+                      "p12"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "certificate"
+                    ]
+                  }
+                ],
+                "examples": [
+                  {
+                    "ipaUrl": "https://files.example.net/app.ipa",
+                    "appName": "Example App",
+                    "bundleId": "com.example.app",
+                    "version": "1.2.3"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Request validated and queued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AcceptedJob"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or missing fields, unsupported signer, invalid file extension or invalid IPA URL.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "One or more uploaded files exceed their configured size limit.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Signing source-IP rate limit exceeded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Tigris storage or job encryption is unavailable.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/discord/sign": {
+      "post": {
+        "tags": [
+          "Signing"
+        ],
+        "summary": "Discord-compatible signing submission",
+        "description": "Exact alias for POST /sign with identical fields and responses.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "ipa": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "IPA file, mutually exclusive with ipaUrl; 4 GiB default limit."
+                  },
+                  "ipaUrl": {
+                    "type": "string",
+                    "format": "uri",
+                    "description": "Public direct HTTPS URL for IPA; the only URL-valued input."
+                  },
+                  "p12": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Required .p12/.pfx certificate file; alias certificate."
+                  },
+                  "certificate": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Legacy alias for p12."
+                  },
+                  "mobileprovision": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Required mobileprovision file; alias profile."
+                  },
+                  "profile": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Legacy alias for mobileprovision."
+                  },
+                  "password": {
+                    "type": "string",
+                    "description": "P12 password; blank if unencrypted."
+                  },
+                  "icon": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Optional PNG app icon."
+                  },
+                  "deb": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Optional .deb tweak bundle."
+                  },
+                  "dylib": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Optional .dylib injection."
+                  },
+                  "tweaks": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "format": "binary"
+                    },
+                    "description": "Legacy bot alias for up to two .deb/.dylib files."
+                  },
+                  "appName": {
+                    "type": "string",
+                    "maxLength": 200
+                  },
+                  "app_name": {
+                    "type": "string",
+                    "description": "Alias for appName."
+                  },
+                  "bundleName": {
+                    "type": "string",
+                    "description": "Alias for appName."
+                  },
+                  "bundleId": {
+                    "type": "string",
+                    "maxLength": 200
+                  },
+                  "bundle_id": {
+                    "type": "string",
+                    "description": "Alias for bundleId."
+                  },
+                  "bundleVersion": {
+                    "type": "string",
+                    "maxLength": 100
+                  },
+                  "bundle_version": {
+                    "type": "string",
+                    "description": "Alias for bundleVersion."
+                  },
+                  "version": {
+                    "type": "string",
+                    "description": "Alias for bundleVersion."
+                  },
+                  "injectExtensions": {
+                    "type": "boolean",
+                    "description": "Also inject dylibs into app extensions."
+                  },
+                  "signer": {
+                    "type": "string",
+                    "enum": [
+                      "zsign"
+                    ],
+                    "default": "zsign"
+                  }
+                },
+                "oneOf": [
+                  {
+                    "required": [
+                      "ipa"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "ipaUrl"
+                    ]
+                  }
+                ],
+                "anyOf": [
+                  {
+                    "required": [
+                      "p12"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "certificate"
+                    ]
+                  }
+                ],
+                "examples": [
+                  {
+                    "ipaUrl": "https://files.example.net/app.ipa",
+                    "appName": "Example App",
+                    "bundleId": "com.example.app",
+                    "version": "1.2.3"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Request validated and queued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AcceptedJob"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or missing fields, unsupported signer, invalid file extension or invalid IPA URL.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "One or more uploaded files exceed their configured size limit.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Signing source-IP rate limit exceeded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Tigris storage or job encryption is unavailable.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/jobs/{jobId}": {
+      "get": {
+        "tags": [
+          "Signing"
+        ],
+        "summary": "Poll job status and logs",
+        "description": "Poll until completed or failed. Use the returned jobToken as a Bearer token. after is the last log sequence ID already received.",
+        "security": [
+          {
+            "jobBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "jobId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Job state; completed API jobs include result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid job ID.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Job not found or job token invalid.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Job metadata is unavailable.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/jobs/{jobId}/download-url": {
+      "post": {
+        "tags": [
+          "Results"
+        ],
+        "summary": "Create temporary signed IPA download URL",
+        "security": [
+          {
+            "jobBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "jobId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Download URL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "url": {
+                      "type": "string",
+                      "format": "uri"
+                    },
+                    "expiresIn": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "url",
+                    "expiresIn"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid job ID.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Job not found or token invalid.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Job is not complete yet.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Signed IPA expired and was deleted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Could not create download URL.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/jobs/{jobId}/ota-url": {
+      "post": {
+        "tags": [
+          "Results"
+        ],
+        "summary": "Create an iOS OTA install URL",
+        "security": [
+          {
+            "jobBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "jobId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OTA links and app metadata",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "appName": {
+                      "type": "string"
+                    },
+                    "bundleId": {
+                      "type": "string"
+                    },
+                    "version": {
+                      "type": "string"
+                    },
+                    "manifestUrl": {
+                      "type": "string",
+                      "format": "uri"
+                    },
+                    "installUrl": {
+                      "type": "string"
+                    },
+                    "expiresAt": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid job ID.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Job not found or token invalid.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Job is not ready or Bundle ID is missing.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Signed IPA expired and was deleted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Could not create OTA URL.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ota/{jobId}/{token}/manifest.plist": {
+      "get": {
+        "tags": [
+          "Results"
+        ],
+        "summary": "Apple OTA manifest",
+        "description": "Returns XML plist for the itms-services install flow. The embedded IPA download expires no later than the signed result.",
+        "parameters": [
+          {
+            "name": "jobId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "token",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OTA plist XML",
+            "content": {
+              "application/xml": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Link expired or unavailable."
+          },
+          "409": {
+            "description": "Bundle ID missing."
+          },
+          "503": {
+            "description": "Manifest generation failed."
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "summary": "Runtime readiness",
+        "responses": {
+          "200": {
+            "description": "Required runtime configuration exists."
+          },
+          "503": {
+            "description": "Required dependency missing."
+          }
+        }
+      }
+    },
+    "/api/v1/discord/health": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "summary": "Discord bot health compatibility endpoint",
+        "responses": {
+          "200": {
+            "description": "Signer ready."
+          },
+          "503": {
+            "description": "Service degraded."
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "jobBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "jobToken"
+      }
+    },
+    "parameters": {
+      "JobId": {
+        "name": "jobId",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        }
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "const": false
+          },
+          "ok": {
+            "type": "boolean",
+            "const": false
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "error"
+        ]
+      },
+      "AcceptedJob": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "const": true
+          },
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "jobId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "job_id": {
+            "type": "string"
+          },
+          "jobToken": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "const": "queued"
+          },
+          "stage": {
+            "type": "string"
+          },
+          "progress": {
+            "type": "number"
+          },
+          "message": {
+            "type": "string"
+          },
+          "poll_after_ms": {
+            "type": "integer"
+          },
+          "statusUrl": {
+            "type": "string",
+            "format": "uri"
+          },
+          "status_url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "progressUrl": {
+            "type": "string",
+            "format": "uri"
+          },
+          "progress_url": {
+            "type": "string",
+            "format": "uri"
+          }
+        },
+        "required": [
+          "success",
+          "jobId",
+          "jobToken",
+          "statusUrl"
+        ]
+      },
+      "JobStatus": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "jobId": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "signing",
+              "completed",
+              "failed"
+            ]
+          },
+          "phase": {
+            "type": "string"
+          },
+          "stage": {
+            "type": "string"
+          },
+          "progress": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "poll_after_ms": {
+            "type": "integer"
+          },
+          "message": {
+            "type": "string"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "logs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "integer"
+                },
+                "at": {
+                  "type": "integer"
+                },
+                "stream": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "result": {
+            "type": "object",
+            "description": "Present when completed; includes downloadUrl/download_url and when Bundle ID is available manifestUrl/installUrl/otaUrl/ota_url."
+          }
+        }
+      }
+    }
+  }
+}

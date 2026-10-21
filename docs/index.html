@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow,noarchive">
+<meta name="referrer" content="no-referrer">
+<title>xsigner API documentation</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1020;--panel:#121a2e;--panel2:#17223a;--text:#edf2ff;--muted:#a6b2ca;--line:#2a3855;--accent:#87b4ff;--green:#84e1bc;--yellow:#ffd58a;--red:#ff9caa;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--sans:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:24px}body{margin:0;background:radial-gradient(ellipse at top left,#192746 0,transparent 46%),var(--bg);color:var(--text);font:15px/1.65 var(--sans)}a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}.wrap{max-width:1200px;margin:auto;padding:36px 22px 80px}.hero{padding:30px 0 26px;border-bottom:1px solid var(--line)}.eyebrow{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);font-weight:800}.hero h1{font-size:clamp(34px,5vw,58px);line-height:1.04;letter-spacing:-.04em;margin:12px 0}.hero p{max-width:780px;color:var(--muted);font-size:17px}.pills{display:flex;flex-wrap:wrap;gap:8px;margin-top:22px}.pill{border:1px solid var(--line);border-radius:999px;background:#111b30;padding:4px 10px;font-size:12px;color:var(--muted)}.pill.good{color:var(--green);border-color:#2c6658}.notice{margin-top:24px;border:1px solid #66522c;background:#2a2318;color:#ffdfa2;border-radius:12px;padding:14px 16px}.layout{display:grid;grid-template-columns:220px minmax(0,1fr);gap:30px;margin-top:28px}.nav{position:sticky;top:20px;align-self:start;border:1px solid var(--line);background:#10182aee;border-radius:14px;padding:16px}.nav strong{display:block;margin:0 0 10px}.nav a{display:block;padding:6px 0;color:var(--muted);font-size:13px}.nav a:hover{color:var(--text)}main{min-width:0}section{margin:0 0 38px;scroll-margin-top:20px}h2{font-size:26px;letter-spacing:-.025em;margin:0 0 6px}h3{font-size:17px;margin:24px 0 8px}p{margin:10px 0;color:#d6deee} .muted{color:var(--muted)}.endpoint{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:12px 14px;border:1px solid var(--line);background:var(--panel);border-radius:11px;margin:14px 0}.method{font:800 11px var(--mono);padding:4px 7px;border-radius:6px;background:#193d38;color:var(--green)}.method.get{background:#1d3151;color:#a7cbff}.method.post{background:#193d38;color:var(--green)}.path{font:600 14px var(--mono);overflow-wrap:anywhere}.tag{font-size:12px;color:var(--muted);margin-left:auto}pre{margin:12px 0 18px;padding:16px;overflow:auto;border:1px solid var(--line);background:#080d18;border-radius:12px;color:#dce7ff;font:12.5px/1.65 var(--mono);tab-size:2}code{font-family:var(--mono);font-size:.92em;background:#19243b;padding:2px 5px;border-radius:5px;overflow-wrap:anywhere}pre code{padding:0;background:transparent;overflow-wrap:normal}table{border-collapse:collapse;width:100%;margin:14px 0 18px;font-size:13px}th,td{text-align:left;vertical-align:top;border-bottom:1px solid var(--line);padding:10px 9px}th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);background:#111a2d}td:first-child{font-family:var(--mono);white-space:nowrap}tr:hover td{background:#ffffff05}.cardgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.card{border:1px solid var(--line);background:var(--panel);border-radius:12px;padding:15px}.card h3{margin:0 0 5px}.card p{font-size:13px;color:var(--muted);margin:0}.goodtxt{color:var(--green)}.warntxt{color:var(--yellow)}.errtxt{color:var(--red)}.small{font-size:12px;color:var(--muted)}.steps{counter-reset:s;list-style:none;padding:0}.steps li{counter-increment:s;position:relative;margin:12px 0;padding:0 0 0 40px}.steps li:before{content:counter(s);position:absolute;left:0;top:1px;width:26px;height:26px;display:grid;place-items:center;background:#1b2b47;color:var(--accent);font-weight:800;border-radius:8px}.footer{border-top:1px solid var(--line);padding-top:20px;color:var(--muted);font-size:12px}details{margin:12px 0;border:1px solid var(--line);border-radius:10px;padding:12px 14px;background:var(--panel)}summary{cursor:pointer;font-weight:700}.anchor{color:var(--muted);font-size:14px;font-weight:400;margin-left:8px}@media(max-width:820px){.layout{grid-template-columns:1fr}.nav{position:relative;top:0;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 14px}.nav strong{grid-column:1/-1}.tag{margin-left:0}.cardgrid{grid-template-columns:1fr}.wrap{padding:20px 14px 50px}}@media(max-width:520px){table{display:block;overflow-x:auto;white-space:normal}.nav{grid-template-columns:1fr 1fr}.path{font-size:12px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header class="hero">
+  <div class="eyebrow">xsigner · developer reference</div>
+  <h1>Signing API</h1>
+  <p>Submit an IPA, certificate and provisioning profile to the zsign worker; follow progress; then retrieve a temporary IPA download or iOS OTA installation link. The service uses Tigris for object storage.</p>
+  <div class="pills"><span class="pill good">Engine: zsign</span><span class="pill">Base URL: https://xsigner.onrender.com</span><span class="pill">Node.js 22+ / Discord.js</span><a class="pill" href="/doc/openapi.json">OpenAPI JSON</a></div>
+  <div class="notice"><strong>Access and security:</strong> this documentation page is restricted to the configured owner IP. The <code>/sign</code> API itself is not owner-IP locked and does not require an API key. Submission is public and rate-limited by source IP; job status and results require the job token.</div>
+</header>
+<div class="layout">
+<nav class="nav" aria-label="Documentation navigation"><strong>On this page</strong><a href="#quick-start">Quick start</a><a href="#fields">Fields and file limits</a><a href="#lifecycle">Job lifecycle</a><a href="#endpoints">Endpoints</a><a href="#success">Success responses</a><a href="#errors">Errors and status codes</a><a href="#discord">Discord.js example</a><a href="#storage">Storage and limits</a></nav>
+<main>
+<section id="quick-start"><h2>Quick start <a class="anchor" href="#quick-start">#</a></h2>
+<p>Send <code>multipart/form-data</code>. Choose exactly one IPA source: a file in <code>ipa</code> or a publicly accessible, direct HTTPS URL in <code>ipaUrl</code>. The P12 and provisioning profile must always be file uploads. Do not manually set the multipart <code>Content-Type</code> header; let your HTTP client create the boundary.</p>
+<div class="endpoint"><span class="method post">POST</span><span class="path">/sign</span><span class="tag">202 Accepted when queued</span></div>
+<p>Discord bot compatibility alias: <code>POST /api/v1/discord/sign</code>.</p>
+<pre><code>curl -X POST 'https://xsigner.onrender.com/sign' \
+  -F 'ipaUrl=https://files.example.net/app.ipa' \
+  -F 'p12=@certificate.p12' \
+  -F 'mobileprovision=@profile.mobileprovision' \
+  -F 'password=YOUR_P12_PASSWORD' \
+  -F 'appName=Example App' \
+  -F 'bundleId=com.example.app' \
+  -F 'bundleVersion=1.2.3'</code></pre>
+<p>For a local IPA instead, replace the <code>ipaUrl</code> field with <code>-F 'ipa=@app.ipa'</code>. Never send both fields.</p>
+</section>
+<section id="fields"><h2>Request fields <a class="anchor" href="#fields">#</a></h2><p>Names are case-sensitive. The legacy names in the table are retained for the Discord.js bot sample. The API does not accept URLs for certificates, provisioning profiles, icons or tweaks.</p>
+<table><thead><tr><th>Field</th><th>Type</th><th>Required</th><th>Accepted formats / behavior</th></tr></thead><tbody>
+<tr><td>ipa</td><td>File</td><td>One of <code>ipa</code>/<code>ipaUrl</code></td><td><code>.ipa</code> file; default size cap 4 GiB.</td></tr>
+<tr><td>ipaUrl</td><td>Text URL</td><td>One of <code>ipa</code>/<code>ipaUrl</code></td><td>Direct public HTTPS URL accessible from Render without interactive login, cookies or CAPTCHA. This is the only source URL field.</td></tr>
+<tr><td>p12</td><td>File</td><td>Yes*</td><td><code>.p12</code> or <code>.pfx</code>; max 16 MiB. Alias: <code>certificate</code>.</td></tr>
+<tr><td>mobileprovision</td><td>File</td><td>Yes*</td><td><code>.mobileprovision</code>; max 16 MiB. Alias: <code>profile</code>.</td></tr>
+<tr><td>password</td><td>Text</td><td>No</td><td>P12 password. Use an empty value for an unencrypted certificate.</td></tr>
+<tr><td>icon</td><td>File</td><td>No</td><td>PNG image, max 16 MiB. Forwarded to zsign to replace the primary app icon.</td></tr>
+<tr><td>appName</td><td>Text</td><td>No</td><td>Display-name override, max 200 characters. Aliases: <code>app_name</code>, <code>bundleName</code>, <code>bundle_name</code>.</td></tr>
+<tr><td>bundleId</td><td>Text</td><td>No</td><td>Bundle identifier override, e.g. <code>com.example.app</code>. Alias: <code>bundle_id</code>.</td></tr>
+<tr><td>bundleVersion</td><td>Text</td><td>No</td><td>Bundle version override. Alias: <code>bundle_version</code>, <code>version</code>.</td></tr>
+<tr><td>deb</td><td>File</td><td>No</td><td><code>.deb</code> package, max 256 MiB. Extracts compatible <code>.dylib</code> files for injection.</td></tr>
+<tr><td>dylib</td><td>File</td><td>No</td><td><code>.dylib</code>, max 128 MiB. Injected directly. May be used with <code>deb</code>.</td></tr>
+<tr><td>tweaks</td><td>File(s)</td><td>No</td><td>Legacy Discord bot field for up to two <code>.deb</code>/<code>.dylib</code> files; max 256 MiB per multipart parser and validated by extension.</td></tr>
+<tr><td>injectExtensions</td><td>Text boolean</td><td>No</td><td>Set <code>true</code>, <code>1</code> or <code>yes</code> to also inject dylibs into app extensions using zsign's <code>-P</code> option.</td></tr>
+<tr><td>signer</td><td>Text</td><td>No</td><td>Only <code>zsign</code> is supported. Requests for <code>rcodesign</code> return 400 instead of silently using the wrong engine.</td></tr>
+</tbody></table>
+<p class="small">* Required file name fields accept either the canonical <code>p12</code>/<code>mobileprovision</code> or bot-compatible <code>certificate</code>/<code>profile</code> aliases. Do not send a URL for these assets.</p>
+</section>
+<section id="lifecycle"><h2>Signing lifecycle <a class="anchor" href="#lifecycle">#</a></h2>
+<ol class="steps"><li><strong>Validate and queue.</strong> The server checks file names, file limits, the public HTTPS URL and metadata, then uploads assets to private Tigris storage. An accepted job gets a unique <code>jobId</code> and a secret <code>jobToken</code>.</li><li><strong>Prepare the worker workspace.</strong> Uploaded input objects are streamed from Tigris to temporary local files. For <code>ipaUrl</code>, the IPA is streamed directly from the remote host into the temporary workspace.</li><li><strong>Sign with zsign.</strong> The worker applies app name, bundle ID, version, icon, and optional tweak injection. A <code>.deb</code> is extracted and any compatible contained dylibs are injected.</li><li><strong>Upload the result.</strong> The signed IPA is multipart-uploaded to Tigris; input certificate/profile/tweak objects are cleaned up after processing.</li><li><strong>Poll and install.</strong> Poll the status URL using the job token. On completion, the status response includes a temporary download URL and, when a bundle ID is available, an OTA link.</li></ol>
+</section>
+<section id="endpoints"><h2>Endpoints <a class="anchor" href="#endpoints">#</a></h2>
+<div class="endpoint"><span class="method get">GET</span><span class="path">/</span><span class="tag">JSON API summary</span></div><p>Returns the service name, signing engine, input rule and core endpoint list.</p>
+<div class="endpoint"><span class="method get">GET</span><span class="path">/healthz</span><span class="tag">Render readiness</span></div><p>Configured as the Render service health check. Reports zsign presence, Tigris configuration and job-encryption configuration. Returns HTTP 200 when ready or HTTP 503 when a required component is missing. <code>/health</code> remains an alias.</p>
+<div class="endpoint"><span class="method get">GET</span><span class="path">/api/v1/discord/health</span><span class="tag">Bot health check</span></div><p>Returns a status value and dependency summary. <code>status</code> is <code>ok</code> only when the signer binary and required server configuration are present; otherwise the endpoint returns a degraded status.</p>
+<div class="endpoint"><span class="method post">POST</span><span class="path">/sign</span><span class="tag">Submit signing job</span></div><p>Multipart fields documented above. The equivalent Discord alias is <code>POST /api/v1/discord/sign</code>. No API key or owner IP is required for submission.</p>
+<div class="endpoint"><span class="method get">GET</span><span class="path">/api/jobs/{jobId}?after=0</span><span class="tag">Poll state / logs / result</span></div><p>Send <code>Authorization: Bearer {jobToken}</code>. The <code>after</code> query parameter is the last log sequence ID you processed; use 0 for all retained logs. Status requests return the current phase, progress and new logs.</p>
+<pre><code>curl 'https://xsigner.onrender.com/api/jobs/JOB_ID?after=0' \
+  -H 'Authorization: Bearer JOB_TOKEN'</code></pre>
+<div class="endpoint"><span class="method post">POST</span><span class="path">/api/jobs/{jobId}/download-url</span><span class="tag">Mint direct download URL</span></div><p>Requires the job token. Returns <code>{"url":"https://...","expiresIn":123}</code>. Returns 409 if the job is not complete, or 410 after retention expires.</p>
+<div class="endpoint"><span class="method post">POST</span><span class="path">/api/jobs/{jobId}/ota-url</span><span class="tag">Mint OTA install URL</span></div><p>Requires the job token. Returns the app metadata plus <code>manifestUrl</code>, <code>installUrl</code> and <code>expiresAt</code>. Requires a Bundle ID.</p>
+<div class="endpoint"><span class="method get">GET</span><span class="path">/ota/{jobId}/{token}/manifest.plist</span><span class="tag">iOS OTA manifest</span></div><p>Used by iOS after opening the <code>itms-services://</code> install URL. Returns an XML property list; it is not a JSON endpoint. The embedded signed IPA URL expires with the signed result.</p>
+<div class="endpoint"><span class="method get">GET</span><span class="path">/sign</span><span class="tag">405 Method Not Allowed</span></div><p>Use POST for signing. Other unknown paths return JSON 404, except the owner-only <code>/doc</code> reference page and its OpenAPI file.</p>
+</section>
+<section id="success"><h2>Success response examples <a class="anchor" href="#success">#</a></h2>
+<h3>1. Accepted (HTTP 202)</h3><pre><code>{
+  "success": true,
+  "ok": true,
+  "jobId": "95a5f6b4-3974-40ce-b59b-0ed575bea0d2",
+  "job_id": "95a5f6b4-3974-40ce-b59b-0ed575bea0d2",
+  "jobToken": "RETURNED_SECRET_TOKEN",
+  "status": "queued",
+  "stage": "queued",
+  "progress": 64,
+  "message": "Signing request accepted and queued for zsign.",
+  "poll_after_ms": 1000,
+  "statusUrl": "https://xsigner.onrender.com/api/jobs/95a5f6b4-3974-40ce-b59b-0ed575bea0d2?after=0",
+  "progressUrl": "https://xsigner.onrender.com/api/jobs/95a5f6b4-3974-40ce-b59b-0ed575bea0d2?after=0"
+}</code></pre>
+<p><strong>Store the real returned token securely.</strong> The values above are illustrative. Submission is asynchronous; HTTP 202 means the job was queued, not that signing has finished.</p>
+<h3>2. In progress (HTTP 200)</h3><pre><code>{
+  "success": true,
+  "ok": true,
+  "jobId": "JOB_ID",
+  "status": "signing",
+  "phase": "signing",
+  "stage": "signing",
+  "progress": 76,
+  "poll_after_ms": 1000,
+  "message": "...",
+  "error": null,
+  "logSequence": 18,
+  "logs": [{"id": 18, "at": 1792600000000, "stream": "system", "message": "Starting upstream zsign CLI..."}]
+}</code></pre>
+<h3>3. Completed (HTTP 200)</h3><pre><code>{
+  "success": true,
+  "ok": true,
+  "status": "completed",
+  "progress": 100,
+  "error": null,
+  "result": {
+    "appName": "Example App",
+    "bundleId": "com.example.app",
+    "version": "1.2.3",
+    "signingTime": "42s",
+    "downloadUrl": "https://...temporary-signed-URL...",
+    "download_url": "https://...temporary-signed-URL...",
+    "manifestUrl": "https://xsigner.onrender.com/ota/JOB_ID/OTA_TOKEN/manifest.plist",
+    "installUrl": "itms-services://?action=download-manifest&url=...",
+    "otaUrl": "itms-services://?action=download-manifest&url=...",
+    "ota_url": "itms-services://?action=download-manifest&url=..."
+  }
+}</code></pre>
+<p>If the app's Bundle ID cannot be determined, the IPA can still be signed and downloaded, but the response will include <code>otaError</code> and no OTA link. Supply <code>bundleId</code> to enable OTA.</p>
+<h3>4. Failed job (HTTP 200 for the poll; job status is failed)</h3><pre><code>{
+  "success": true,
+  "ok": true,
+  "status": "failed",
+  "stage": "failed",
+  "progress": 70,
+  "error": "Useful signing failure message",
+  "logs": [{"id": 21, "stream": "error", "message": "..."}]
+}</code></pre><p>Polling itself succeeded; check <code>status</code> and <code>error</code> to determine whether the signing operation failed.</p>
+</section>
+<section id="errors"><h2>Errors and status codes <a class="anchor" href="#errors">#</a></h2>
+<table><thead><tr><th>HTTP</th><th>Meaning</th><th>What to do</th></tr></thead><tbody>
+<tr><td>400</td><td>Bad input; invalid URL; unsupported signer; missing IPA, P12 or profile; invalid metadata/file extension.</td><td>Correct the multipart fields. Use only <code>ipa</code> or <code>ipaUrl</code>; the P12/profile must be files.</td></tr>
+<tr><td>404</td><td>Unknown route, invalid job ID, missing job, or missing/incorrect job token.</td><td>Verify the ID and send <code>Authorization: Bearer JOB_TOKEN</code>. Job access failures intentionally do not disclose whether a job exists.</td></tr>
+<tr><td>405</td><td>Wrong method, notably GET /sign.</td><td>Submit signing requests with POST.</td></tr>
+<tr><td>409</td><td>Download or OTA is not ready yet; or OTA cannot be generated without a Bundle ID.</td><td>Poll until completed or re-submit with a Bundle ID.</td></tr>
+<tr><td>410</td><td>Signed IPA has expired and was deleted.</td><td>Sign the app again. Signed results are retained for 10 minutes after completion.</td></tr>
+<tr><td>413</td><td>Uploaded file is above its field's byte limit.</td><td>Use a smaller file or a direct public <code>ipaUrl</code> if the IPA is the large input.</td></tr>
+<tr><td>429</td><td>Too many signing requests or status/action requests.</td><td>Respect rate limits and retry with backoff. The default sign limit is 30 submissions per source IP per 15 minutes.</td></tr>
+<tr><td>500</td><td>Unexpected server error.</td><td>Retry cautiously and inspect Render application logs.</td></tr>
+<tr><td>503</td><td>Tigris, signer configuration, encryption configuration, or URL generation unavailable.</td><td>Check <code>/healthz</code>, Render env variables, Tigris credentials/bucket permissions, and the zsign binary.</td></tr>
+<tr><td>200 + status=failed</td><td>Signing worker started but failed while downloading, unpacking, modifying or signing.</td><td>Read the poll response's <code>error</code> and latest <code>logs</code> entry. HTTP 200 only means the polling request succeeded.</td></tr>
+</tbody></table>
+<details><summary>Remote IPA URL returns HTTP 403</summary><p>A 403 means the remote file host refused xsigner's download. The source host may require login, cookies, a browser challenge, a fresh direct-download URL, or documented hotlink authorization. Use a direct public HTTPS URL which works from a server, or adjust your own source host's documented allowlist/headers. Tigris does not bypass the source host's access controls.</p></details>
+</section>
+<section id="discord"><h2>Discord.js / Node.js integration <a class="anchor" href="#discord">#</a></h2>
+<p>The project includes <code>examples/discord-sign-api-client.js</code>, exporting <code>submitAndPollXsign(input)</code>. Copy the helper into your bot repository or vendor it as an ES module. It accepts Discord attachment objects with <code>url</code> and <code>name</code>, submits form data, polls with the job token and returns a flattened result for the response code in your bot.</p>
+<pre><code>import { submitAndPollXsign, wrapOtaInstallUrl } from './discord-sign-api-client.js';
+
+const signed = await submitAndPollXsign({
+  apiBase: 'https://xsigner.onrender.com',
+  ipaUrl: 'https://cdn.example.net/app.ipa', // OR pass ipa: attachment
+  certificate: certAttachment,               // .p12/.pfx attachment
+  profile: profileAttachment,                // .mobileprovision attachment
+  password: p12Password,
+  appName: 'Example App',
+  bundleId: 'com.example.app',
+  version: '1.2.3',
+  onProgress: async job => {
+    // Update the Discord interaction/reply when stage or progress changes.
+    console.log(job.stage, job.progress, job.message);
+  }
+});
+
+console.log(signed.downloadUrl); // temporary .ipa download
+console.log(signed.otaUrl);      // itms-services:// install link
+console.log(wrapOtaInstallUrl(signed.otaUrl)); // optional OTA landing-page wrapper</code></pre>
+<p>For IPAs over 500 MiB, the included helper recommends <code>ipaUrl</code> to avoid buffering the complete IPA in the Discord bot process. The server itself accepts streamed remote IPA files up to the configured 4 GiB limit. <code>ipaUrl</code> must point to a direct public HTTPS download without interactive authentication.</p>
+<p><strong>Legacy bot:</strong> the API accepts <code>certificate</code>/<code>profile</code>/<code>tweaks</code> field names and includes response aliases such as <code>job_id</code>, <code>progress_url</code>, <code>download_url</code> and <code>ota_url</code>. New bot code should poll with the returned <code>jobToken</code>. If the legacy bot submits an Authorization bearer, the API supports that same bearer for polling only the job created by that request.</p>
+</section>
+<section id="storage"><h2>Storage, expiry and operational limits <a class="anchor" href="#storage">#</a></h2>
+<div class="cardgrid"><div class="card"><h3>Private source assets</h3><p>IPA file uploads, certificate/profile files and tweak assets are stored privately in Tigris while the worker needs them, then removed after processing.</p></div><div class="card"><h3>Signed result TTL</h3><p>The signed IPA is deleted from Tigris about 10 minutes after completion. Download and OTA URLs cannot outlive that deadline.</p></div><div class="card"><h3>Temporary workspace</h3><p>zsign requires local filesystem capacity to unpack, patch and archive IPA contents. Tigris is object storage, not a drop-in filesystem for zsign's working directory. Large apps may need several times their IPA size in scratch space.</p></div><div class="card"><h3>Remote URL restrictions</h3><p>Only HTTPS URLs resolving to public IPs are accepted; each redirect is re-validated. Private network and localhost addresses are blocked to reduce SSRF risk.</p></div></div>
+<p>Default server limits: IPA 4 GiB; certificate/profile/icon 16 MiB each; .deb 256 MiB; .dylib 128 MiB; 30 signing submissions per source IP per 15 minutes; one active signing job at a time unless <code>MAX_CONCURRENT_JOBS</code> is changed. A submitted Discord app can have a lower attachment limit imposed by Discord or the included helper; use <code>ipaUrl</code> for a very large source.</p>
+<p>Keep Tigris credentials and <code>JOB_ENCRYPTION_KEY</code> in Render's environment settings, never in bot source control. The job token grants access to status and results for its job, so don't post it publicly or log it in a public channel.</p>
+</section>
+<footer class="footer">xsigner API reference · The examples use placeholder IDs, passwords, URLs and tokens. The actual response from the running service is authoritative for current job state and temporary links.</footer>
+</main>
+</div>
+</div>
+</body>
+</html>
