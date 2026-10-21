@@ -20,6 +20,7 @@ async function attachmentToBlob(attachment, maxBytes, label) {
  * For IPA files over 500 MiB, use ipaUrl to avoid buffering the IPA in the bot process.
  * @param {object} input
  * @param {string} [input.apiBase]
+ * @param {string} [input.apiKey] Optional API key. Required only if the service owner enables API_CLIENTS_JSON.
  * @param {object} [input.ipa] Discord.js Attachment object for an uploaded .ipa (up to 500 MiB in this helper)
  * @param {string} [input.ipaUrl] public direct HTTPS .ipa URL (mutually exclusive with ipa)
  * @param {object} input.certificate Discord.js Attachment (.p12/.pfx)
@@ -74,8 +75,9 @@ export async function submitAndPollXsign(input) {
     else throw new Error(`Tweak ${i + 1} must be a .deb or .dylib file.`);
   }
 
+  const submitHeaders = input.apiKey ? {'X-API-Key': String(input.apiKey)} : {};
   const submit = await fetch(`${apiBase}/api/v1/discord/sign`, {
-    method: 'POST', body: form, signal: AbortSignal.timeout(60 * 60 * 1000)
+    method: 'POST', headers: submitHeaders, body: form, signal: AbortSignal.timeout(60 * 60 * 1000)
   });
   const initial = await submit.json().catch(() => ({}));
   if (submit.status !== 202 || initial.success !== true) {
