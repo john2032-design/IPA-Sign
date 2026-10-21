@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "xsigner IPA Signing API",
-    "version": "2.0.1",
-    "description": "Async IPA signing via zsign and Tigris object storage. Documentation is owner-IP-only; /sign is public and rate-limited. Upload ipa or pass ipaUrl; p12 and mobileprovision are always files."
+    "version": "2.1.0",
+    "description": "Async IPA signing via zsign and Tigris object storage. Documentation is owner-IP-only. Signing submissions remain public and source-IP rate-limited while API_CLIENTS_JSON is unset; when configured, X-API-Key becomes required and per-client quotas apply. Upload ipa or pass ipaUrl; p12 and mobileprovision are always files. JSON responses carry requestId and X-Request-ID. Remote HTTPS downloads pin validated DNS answers. Optional Redis/BullMQ mode enables shared worker queues, S3-backed manifests, and cross-instance client quotas."
   },
   "servers": [
     {
@@ -30,12 +30,23 @@
         "summary": "Render health check (alias of /health)",
         "responses": {
           "200": {
-            "description": "Required runtime configuration exists."
+            "description": "Required runtime configuration exists.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            }
           },
           "503": {
-            "description": "Required dependency missing."
+            "description": "Required dependency missing.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            }
           }
-        }
+        },
+        "description": "Fast configuration readiness endpoint for Render. Returns X-Request-ID; see /healthz/dependencies for cached deeper diagnostics."
       }
     },
     "/sign": {
@@ -44,7 +55,7 @@
           "Signing"
         ],
         "summary": "Submit an IPA signing job",
-        "description": "Public submission with no API key or owner-IP restriction. Default limit: 30 submissions per source IP per 15 minutes. Alias: /api/v1/discord/sign.",
+        "description": "Multipart signing submission. With API_CLIENTS_JSON unset, no API key is required and anonymous requests are source-IP rate-limited. If API_CLIENTS_JSON is configured, send X-API-Key; each configured client has an independent quota, plus an authenticated per-IP safety ceiling. Alias: /api/v1/discord/sign.",
         "requestBody": {
           "required": true,
           "content": {
@@ -198,6 +209,11 @@
                   "$ref": "#/components/schemas/AcceptedJob"
                 }
               }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
             }
           },
           "400": {
@@ -207,6 +223,26 @@
                 "schema": {
                   "$ref": "#/components/schemas/Error"
                 }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            }
+          },
+          "401": {
+            "description": "API_CLIENTS_JSON is configured but X-API-Key is missing or invalid.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
               }
             }
           },
@@ -218,15 +254,25 @@
                   "$ref": "#/components/schemas/Error"
                 }
               }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
             }
           },
           "429": {
-            "description": "Signing source-IP rate limit exceeded.",
+            "description": "Anonymous source-IP limit, authenticated per-client quota, or authenticated per-IP safety ceiling exceeded. Authenticated client quota responses include code API_CLIENT_RATE_LIMITED, Retry-After, and X-API-Client quota headers.",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/Error"
                 }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
               }
             }
           },
@@ -238,9 +284,20 @@
                   "$ref": "#/components/schemas/Error"
                 }
               }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
             }
           }
-        }
+        },
+        "security": [
+          {},
+          {
+            "apiKeyAuth": []
+          }
+        ]
       }
     },
     "/api/v1/discord/sign": {
@@ -249,7 +306,7 @@
           "Signing"
         ],
         "summary": "Discord-compatible signing submission",
-        "description": "Exact alias for POST /sign with identical fields and responses.",
+        "description": "Multipart signing submission. With API_CLIENTS_JSON unset, no API key is required and anonymous requests are source-IP rate-limited. If API_CLIENTS_JSON is configured, send X-API-Key; each configured client has an independent quota, plus an authenticated per-IP safety ceiling. Alias: /sign.",
         "requestBody": {
           "required": true,
           "content": {
@@ -403,6 +460,11 @@
                   "$ref": "#/components/schemas/AcceptedJob"
                 }
               }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
             }
           },
           "400": {
@@ -412,6 +474,26 @@
                 "schema": {
                   "$ref": "#/components/schemas/Error"
                 }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            }
+          },
+          "401": {
+            "description": "API_CLIENTS_JSON is configured but X-API-Key is missing or invalid.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
               }
             }
           },
@@ -423,15 +505,25 @@
                   "$ref": "#/components/schemas/Error"
                 }
               }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
             }
           },
           "429": {
-            "description": "Signing source-IP rate limit exceeded.",
+            "description": "Anonymous source-IP limit, authenticated per-client quota, or authenticated per-IP safety ceiling exceeded. Authenticated client quota responses include code API_CLIENT_RATE_LIMITED, Retry-After, and X-API-Client quota headers.",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/Error"
                 }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
               }
             }
           },
@@ -443,9 +535,20 @@
                   "$ref": "#/components/schemas/Error"
                 }
               }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
             }
           }
-        }
+        },
+        "security": [
+          {},
+          {
+            "apiKeyAuth": []
+          }
+        ]
       }
     },
     "/api/jobs/{jobId}": {
@@ -490,6 +593,11 @@
                   "$ref": "#/components/schemas/JobStatus"
                 }
               }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
             }
           },
           "400": {
@@ -499,6 +607,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/Error"
                 }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
               }
             }
           },
@@ -510,6 +623,11 @@
                   "$ref": "#/components/schemas/Error"
                 }
               }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
             }
           },
           "503": {
@@ -519,6 +637,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/Error"
                 }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
               }
             }
           }
@@ -561,6 +684,14 @@
                     },
                     "expiresIn": {
                       "type": "integer"
+                    },
+                    "expiresAt": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "expiresAtMs": {
+                      "type": "integer",
+                      "format": "int64"
                     }
                   },
                   "required": [
@@ -568,6 +699,11 @@
                     "expiresIn"
                   ]
                 }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
               }
             }
           },
@@ -579,6 +715,11 @@
                   "$ref": "#/components/schemas/Error"
                 }
               }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
             }
           },
           "404": {
@@ -588,6 +729,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/Error"
                 }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
               }
             }
           },
@@ -599,6 +745,11 @@
                   "$ref": "#/components/schemas/Error"
                 }
               }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
             }
           },
           "410": {
@@ -609,6 +760,11 @@
                   "$ref": "#/components/schemas/Error"
                 }
               }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
             }
           },
           "503": {
@@ -618,6 +774,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/Error"
                 }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
               }
             }
           }
@@ -676,6 +837,11 @@
                   }
                 }
               }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
             }
           },
           "400": {
@@ -685,6 +851,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/Error"
                 }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
               }
             }
           },
@@ -696,6 +867,11 @@
                   "$ref": "#/components/schemas/Error"
                 }
               }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
             }
           },
           "409": {
@@ -705,6 +881,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/Error"
                 }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
               }
             }
           },
@@ -716,6 +897,11 @@
                   "$ref": "#/components/schemas/Error"
                 }
               }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
             }
           },
           "503": {
@@ -725,6 +911,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/Error"
                 }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
               }
             }
           }
@@ -766,16 +957,36 @@
                   "type": "string"
                 }
               }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
             }
           },
           "404": {
-            "description": "Link expired or unavailable."
+            "description": "Link expired or unavailable.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            }
           },
           "409": {
-            "description": "Bundle ID missing."
+            "description": "Bundle ID missing.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            }
           },
           "503": {
-            "description": "Manifest generation failed."
+            "description": "Manifest generation failed.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            }
           }
         }
       }
@@ -788,10 +999,20 @@
         "summary": "Runtime readiness",
         "responses": {
           "200": {
-            "description": "Required runtime configuration exists."
+            "description": "Required runtime configuration exists.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            }
           },
           "503": {
-            "description": "Required dependency missing."
+            "description": "Required dependency missing.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            }
           }
         }
       }
@@ -804,10 +1025,131 @@
         "summary": "Discord bot health compatibility endpoint",
         "responses": {
           "200": {
-            "description": "Signer ready."
+            "description": "Signer ready.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            }
           },
           "503": {
-            "description": "Service degraded."
+            "description": "Service degraded.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/healthz/dependencies": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "summary": "Cached dependency diagnostic check",
+        "description": "Runs bounded/cached diagnostics for zsign, Tigris bucket access, workspace writability, job encryption, and Redis when shared queue mode is enabled. Does not reveal credentials.",
+        "responses": {
+          "200": {
+            "description": "All configured dependencies are reachable.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            }
+          },
+          "503": {
+            "description": "One or more dependency checks failed.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/ops/metrics": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "summary": "Owner-only operational metrics",
+        "description": "Restricted to the configured OWNER_IP. Reports queue depth, worker concurrency, process uptime, informational disk availability and result retention. Does not return secrets and does not enforce disk-based admission limits.",
+        "responses": {
+          "200": {
+            "description": "Operational snapshot (disk statistics may be unavailable independently).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "service": {
+                      "type": "string"
+                    },
+                    "timestamp": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "uptimeSeconds": {
+                      "type": "integer"
+                    },
+                    "queue": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "disk": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "results": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "runtime": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "requestId": {
+                      "type": "string",
+                      "format": "uuid"
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            }
+          },
+          "404": {
+            "description": "Requester is not the configured documentation/owner IP.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            }
+          },
+          "503": {
+            "description": "Metrics aggregation failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            }
           }
         }
       }
@@ -819,6 +1161,12 @@
         "type": "http",
         "scheme": "bearer",
         "bearerFormat": "jobToken"
+      },
+      "apiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key",
+        "description": "Conditional: optional by default; required on signing submissions when API_CLIENTS_JSON is configured."
       }
     },
     "parameters": {
@@ -846,6 +1194,15 @@
           },
           "error": {
             "type": "string"
+          },
+          "code": {
+            "type": "string",
+            "description": "Stable machine-readable error code."
+          },
+          "requestId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Server-generated request correlation ID."
           }
         },
         "required": [
@@ -904,6 +1261,10 @@
           "progress_url": {
             "type": "string",
             "format": "uri"
+          },
+          "requestId": {
+            "type": "string",
+            "format": "uuid"
           }
         },
         "required": [
@@ -983,7 +1344,29 @@
           "result": {
             "type": "object",
             "description": "Present when completed; includes downloadUrl/download_url and when Bundle ID is available manifestUrl/installUrl/otaUrl/ota_url."
+          },
+          "requestId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "resultExpiresAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Signed-result deletion deadline, when completed."
+          },
+          "resultExpiresAtMs": {
+            "type": "integer",
+            "format": "int64"
           }
+        }
+      }
+    },
+    "headers": {
+      "RequestIdHeader": {
+        "description": "Server-generated request correlation ID. Include it with bug reports or support requests.",
+        "schema": {
+          "type": "string",
+          "format": "uuid"
         }
       }
     }
