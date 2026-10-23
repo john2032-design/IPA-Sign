@@ -71,7 +71,7 @@
                   "ipaUrl": {
                     "type": "string",
                     "format": "uri",
-                    "description": "Public direct HTTPS URL for IPA; the only URL-valued input."
+                    "description": "Public direct HTTPS download URL for IPA; signed/query-string links, extensionless download paths, and safe HTTPS redirects are supported. The URL must be reachable without interactive authentication; the only URL-valued input."
                   },
                   "p12": {
                     "type": "string",
@@ -322,7 +322,7 @@
                   "ipaUrl": {
                     "type": "string",
                     "format": "uri",
-                    "description": "Public direct HTTPS URL for IPA; the only URL-valued input."
+                    "description": "Public direct HTTPS download URL for IPA; signed/query-string links, extensionless download paths, and safe HTTPS redirects are supported. The URL must be reachable without interactive authentication; the only URL-valued input."
                   },
                   "p12": {
                     "type": "string",

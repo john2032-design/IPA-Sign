@@ -40,6 +40,7 @@ MANIFEST_STORAGE=s3
 RUN_SIGNING_WORKER=true
 DATA_DIR=/tmp/xsigner-worker
 ZSIGN_BIN=/usr/local/bin/zsign
+ZSIGN_ZIP_LEVEL=1
 AWS_ENDPOINT_URL_S3=https://t3.storage.dev
 AWS_REGION=auto
 S3_BUCKET=xsigner
@@ -66,3 +67,10 @@ Workers do not listen on HTTP ports. Their local work directory is scratch space
 BullMQ uses Redis persistence and worker locks/stalled-job recovery. Job manifests must be in S3/Tigris mode when Redis queue mode is enabled; the application fails startup early if `REDIS_URL` is set with local manifest storage. Keep Redis configured with `noeviction` where possible, as BullMQ queue keys must not be evicted under memory pressure.
 
 This optional mode does not add an idempotency key or cancellation endpoint. It intentionally does not change the existing Discord bot contract; submission still returns `202` with `jobId`, `jobToken`, and polling URLs.
+
+
+## Signing and archiving speed
+
+The API defaults `ZSIGN_ZIP_LEVEL=1` instead of zsign's maximum compression level. This is a faster speed/size balance for IPA output. Set `ZSIGN_ZIP_LEVEL=0` for the fastest archive step with no ZIP compression (the resulting IPA can be larger and take longer to upload); use `2`–`9` when output size matters more than signing latency. Values outside `0`–`9` safely fall back to `1`.
+
+`MAX_CONCURRENT_JOBS` defaults to `1` when unset so CPU-heavy zsign jobs do not accidentally compete for the same cores and scratch disk. Increase it only after measuring CPU, memory, and disk throughput on the actual worker; more concurrent jobs improve aggregate throughput in some cases but can make each job slower or cause out-of-space/OOM failures. The Docker build compiles zsign using all available build CPUs to reduce image-build time.

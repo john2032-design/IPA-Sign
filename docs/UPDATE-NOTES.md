@@ -7,10 +7,12 @@ This source package includes the selected API recommendations while preserving t
 1. **Progress redaction fix:** application-generated status messages are not scrubbed with the certificate password. Raw signer output and failure details use dedicated secret sanitization; output does not insert `[REDACTED]` placeholders.
 2. **Optional bot authentication and quotas:** set `API_CLIENTS_JSON` to require `X-API-Key` and configure per-client limits. Leaving it unset preserves the current working bot's public submission contract. With `REDIS_URL`, per-client quotas use atomic Redis counters across API instances.
 5. **Remote URL SSRF mitigation:** remote HTTPS downloads validate public/global IP ranges, pin resolved DNS answers to the outbound connection, and re-resolve each redirect.
+6. **Direct IPA URL compatibility:** accepts public HTTPS `.ipa` links from arbitrary hosts, including the provided `file.ipaomtk.com/Spotify/Spotify-2-IPAOMTK.COM.ipa` example. A regression test covers normalization, validation, filename detection, and the streamed downloader using mocked network responses.
 7. **Operational visibility:** `/healthz/dependencies`, owner-only `/api/ops/metrics`, request-correlated structured logs, queue depths, job queue-wait/signing durations, result size, failure phase/code, and scratch-disk availability. Disk readings are informational only.
 8. **Consistent errors and tests:** stable JSON error codes, request IDs, updated OpenAPI response headers, and regression/mocked integration tests.
 9. **Configurable result retention:** `SIGNED_IPA_TTL_MINUTES` safely clamps to 1–60 minutes; response payloads expose precise expiry timestamps and URLs cannot outlive the result deletion deadline.
 10. **Optional scale-out architecture:** set up Redis/BullMQ and S3-backed manifests for separate API and signing-worker services. It is not enabled by default and no additional billable resources are created automatically. See [`SCALING.md`](SCALING.md).
+11. **Signing/archiving performance:** zsign ZIP compression now defaults to configurable level `1` instead of `9`; level `0` is available for fastest, uncompressed archives. Unconfigured job concurrency now defaults to `1` to reduce resource contention, and zsign build compilation uses all available build CPUs.
 
 ## Explicitly not included
 
