@@ -10,11 +10,15 @@ import {pipeline} from 'node:stream/promises';
 import net from 'node:net';
 
 const source = fs.readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+const normalizeStart = source.indexOf('function normalizeIpaUrlInput(');
 const networkStart = source.indexOf('function ipv6Words(');
 const downloaderStart = source.indexOf('async function downloadRemoteToFile(');
 const downloaderEnd = source.indexOf("app.get(['/healthz', '/health']", downloaderStart);
 assert(networkStart >= 0 && downloaderStart > networkStart && downloaderEnd > downloaderStart, 'URL security/downloader functions were not found');
-const networkBlock = source.slice(networkStart, source.indexOf('\nfunction remoteFilename(', networkStart));
+const networkBlock = source.slice(normalizeStart, source.indexOf('\nfunction remoteFilename(', networkStart));
+const filenameStart = source.indexOf('function remoteFilename(');
+const filenameEnd = source.indexOf('\nfunction makeRemoteUpload(', filenameStart);
+const filenameBlock = source.slice(filenameStart, filenameEnd);
 const downloaderBlock = source.slice(downloaderStart, downloaderEnd);
 const tempRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'xsigner-remote-download-test-'));
 const requestLog = [];
@@ -28,7 +32,9 @@ const dns = {
       'v6private.example.test': [{address: 'fd00::1234', family: 6}],
       'v6linklocal.example.test': [{address: 'fe80::1', family: 6}],
       'v6documentation.example.test': [{address: '2001:db8::1', family: 6}],
-      'mapped-v4.example.test': [{address: '::ffff:127.0.0.1', family: 6}]
+      'mapped-v4.example.test': [{address: '::ffff:127.0.0.1', family: 6}],
+      // Public Cloudflare edge addresses observed for the concrete IPAOMTK example URL.
+      'file.ipaomtk.com': [{address: '104.21.54.106', family: 4}, {address: '172.67.138.49', family: 4}]
     };
     const result = map[host] || [{address: '93.184.216.34', family: 4}, {address: '2606:2800:220:1:248:1893:25c8:1946', family: 6}];
     if (options?.all) return result;
@@ -63,10 +69,23 @@ const sandbox = {
   messageOf: error => error?.message || String(error)
 };
 vm.createContext(sandbox);
-vm.runInContext(`${networkBlock}\n${downloaderBlock}\nglobalThis.urlTests = {isPrivateAddress, resolvePublicHttpsUrl, validatePublicHttpsUrl, downloadRemoteToFile};`, sandbox);
-const {isPrivateAddress, resolvePublicHttpsUrl, downloadRemoteToFile} = sandbox.urlTests;
+sandbox.clampText = value => typeof value === 'string' ? value.trim().slice(0, 4096) : '';
+vm.runInContext(`${networkBlock}\n${filenameBlock}\n${downloaderBlock}\nglobalThis.urlTests = {normalizeIpaUrlInput, isPrivateAddress, resolvePublicHttpsUrl, validatePublicHttpsUrl, remoteFilename, downloadRemoteToFile};`, sandbox);
+const {normalizeIpaUrlInput, isPrivateAddress, resolvePublicHttpsUrl, validatePublicHttpsUrl, remoteFilename, downloadRemoteToFile} = sandbox.urlTests;
 
 try {
+  assert.equal(normalizeIpaUrlInput('  <https://files.example.test/download?id=7>  '), 'https://files.example.test/download?id=7');
+  assert.equal(normalizeIpaUrlInput('https://files.example.test/download?id=7'), 'https://files.example.test/download?id=7');
+  assert.equal(remoteFilename('https://files.example.test/app.ipa?token=abc#details', 'ipa'), 'app.ipa', 'standard IPA paths should survive signed query strings');
+  assert.equal(remoteFilename('https://files.example.test/api/download?token=abc&filename=My%20App.ipa', 'ipa'), 'My App.ipa', 'download endpoints may supply the IPA filename in a query parameter');
+  assert.equal(remoteFilename('https://files.example.test/download?id=123&token=abc', 'ipa'), 'remote-app.ipa', 'extensionless download URLs must still get a local .ipa filename');
+
+  // Keep the user's concrete IPAOMTK-style direct link covered by the same URL-validation
+  // and streamed-download path used in production. Network I/O is mocked below for repeatability.
+  const ipaomtkUrl = 'https://file.ipaomtk.com/Spotify/Spotify-2-IPAOMTK.COM.ipa';
+  assert.equal(normalizeIpaUrlInput(ipaomtkUrl), ipaomtkUrl, 'direct IPAOMTK URL should be accepted as input');
+  assert.equal(remoteFilename(ipaomtkUrl, 'ipa'), 'Spotify-2-IPAOMTK.COM.ipa', 'the URL path should provide the original IPA filename');
+  assert.equal(await validatePublicHttpsUrl(ipaomtkUrl), ipaomtkUrl, 'public HTTPS IPAOMTK URL should pass URL validation');
   assert.equal(isPrivateAddress('127.0.0.1'), true);
   assert.equal(isPrivateAddress('10.0.0.5'), true);
   assert.equal(isPrivateAddress('100.64.0.1'), true);
@@ -86,13 +105,14 @@ try {
   await assert.rejects(() => resolvePublicHttpsUrl('https://v6documentation.example.test/app.ipa'), /globally routable public IP/);
   await assert.rejects(() => resolvePublicHttpsUrl('https://mapped-v4.example.test/app.ipa'), /globally routable public IP/);
   await assert.rejects(() => resolvePublicHttpsUrl('http://files.example.test/app.ipa'), /public HTTPS URL/);
+  assert.equal((await validatePublicHttpsUrl('https://files.example.test/api/download?token=abc#section')).includes('#'), false, 'query-based download URLs should be accepted and fragments removed');
 
   const payload = Buffer.from('a streamed IPA payload for download verification');
   responsePlans = [{status: 200, payload, headers: {'content-length': String(payload.length)}}];
   requestLog.length = 0;
   const output = path.join(tempRoot, 'source.ipa');
   const progress = [];
-  const received = await downloadRemoteToFile('https://files.example.test/app.ipa', output, 1024 * 1024, (loaded, total) => progress.push([loaded, total]));
+  const received = await downloadRemoteToFile('https://files.example.test/api/download?id=123&token=abc', output, 1024 * 1024, (loaded, total) => progress.push([loaded, total]));
   assert.equal(received, payload.length);
   assert.deepEqual(await fsp.readFile(output), payload);
   assert.equal(progress.at(-1)[0], payload.length);
@@ -102,12 +122,21 @@ try {
   assert.equal(requestLog[0].pinnedAddresses[0].address, '93.184.216.34', 'the network request must use the previously validated DNS answer');
   assert.equal(requestLog[0].options.servername, 'files.example.test', 'TLS must still verify against the hostname after DNS pinning');
 
-  responsePlans = [{status: 302, payload: Buffer.alloc(0), headers: {location: 'https://redirect.example.test/new.ipa'}}, {status: 200, payload, headers: {'content-length': String(payload.length)}}];
+  responsePlans = [{status: 200, payload, headers: {'content-length': String(payload.length)}}];
+  requestLog.length = 0;
+  const ipaomtkOutput = path.join(tempRoot, 'ipaomtk-source.ipa');
+  const ipaomtkReceived = await downloadRemoteToFile(ipaomtkUrl, ipaomtkOutput, 1024 * 1024);
+  assert.equal(ipaomtkReceived, payload.length, 'the IPAOMTK direct link should use the regular streamed downloader');
+  assert.equal(requestLog[0].url, ipaomtkUrl, 'the IPAOMTK URL should be requested without being rewritten');
+  assert.equal(requestLog[0].options.servername, 'file.ipaomtk.com', 'TLS must retain the IPAOMTK hostname');
+  assert.equal(requestLog[0].pinnedAddresses[0].address, '104.21.54.106', 'the IPAOMTK host must use its independently validated public address');
+
+  responsePlans = [{status: 302, payload: Buffer.alloc(0), headers: {location: 'https://redirect.example.test/download?id=123&token=abc'}}, {status: 200, payload, headers: {'content-length': String(payload.length)}}];
   requestLog.length = 0;
   const redirectOutput = path.join(tempRoot, 'redirect.ipa');
   await downloadRemoteToFile('https://files.example.test/redirect.ipa', redirectOutput, 1024 * 1024);
   assert.equal(requestLog.length, 2, 'a safe redirect should be followed');
-  assert.equal(requestLog[1].url, 'https://redirect.example.test/new.ipa');
+  assert.equal(requestLog[1].url, 'https://redirect.example.test/download?id=123&token=abc', 'redirects to extensionless, signed download URLs must work');
   assert.equal(requestLog[1].pinnedAddresses[0].address, '93.184.216.34', 'redirect destinations must be resolved and pinned independently');
 
   responsePlans = [{status: 403, payload: Buffer.from('forbidden')}];
@@ -122,7 +151,7 @@ try {
     /exceeding the configured 4 bytes IPA limit/i
   );
 
-  console.log('Remote-download tests passed: stream writing, DNS pinning, public-only IPv4/IPv6 filtering, safe redirects, host 403 diagnostics, and size limit enforcement.');
+  console.log('Remote-download tests passed: IPAOMTK direct URL, generic and signed IPA URLs, query-based filenames, streamed writes, DNS pinning, public-only IPv4/IPv6 filtering, safe redirects, host 403 diagnostics, and size limits.');
 } finally {
   await fsp.rm(tempRoot, {recursive: true, force: true});
 }
