@@ -38,6 +38,12 @@ const ENDPOINT = process.env.AWS_ENDPOINT_URL_S3 || process.env.AWS_ENDPOINT_URL
 const MAX_IPA_BYTES = Number(process.env.MAX_IPA_BYTES || 4294967296);
 const MAX_SMALL_FILE_BYTES = 16 * 1024 * 1024;
 const PART_SIZE = Number(process.env.PART_SIZE_BYTES || 64 * 1024 * 1024);
+// IPA archiving at level 9 is significantly slower. Level 1 is a good speed/size balance;
+// choose 0 for no compression, or 2-9 when smaller downloads matter more than signing time.
+const ZSIGN_ZIP_LEVEL_CONFIG = Number(process.env.ZSIGN_ZIP_LEVEL ?? 1);
+const ZSIGN_ZIP_LEVEL = Number.isInteger(ZSIGN_ZIP_LEVEL_CONFIG) && ZSIGN_ZIP_LEVEL_CONFIG >= 0 && ZSIGN_ZIP_LEVEL_CONFIG <= 9
+  ? ZSIGN_ZIP_LEVEL_CONFIG
+  : 1;
 const JOB_TTL_MS = Number(process.env.JOB_TTL_HOURS || 24) * 60 * 60 * 1000;
 const UPLOAD_TTL_MS = Number(process.env.UPLOAD_TTL_HOURS || 6) * 60 * 60 * 1000;
 const STALE_JOB_MS = Number(process.env.STALE_JOB_MINUTES || 45) * 60 * 1000;
@@ -45,7 +51,10 @@ const SIGNED_IPA_RETENTION_CONFIG = Number(process.env.SIGNED_IPA_TTL_MINUTES);
 const SIGNED_IPA_RETENTION_MINUTES = Number.isFinite(SIGNED_IPA_RETENTION_CONFIG) ? Math.min(60, Math.max(1, SIGNED_IPA_RETENTION_CONFIG)) : 10;
 const SIGNED_IPA_RETENTION_MS = Math.max(60_000, SIGNED_IPA_RETENTION_MINUTES * 60 * 1000);
 const SIGNED_IPA_CLEANUP_INTERVAL_MS = Math.max(10_000, Number(process.env.SIGNED_IPA_CLEANUP_INTERVAL_MS) || 10_000);
-const MAX_CONCURRENT_JOBS = Math.max(1, Number(process.env.MAX_CONCURRENT_JOBS || 30));
+const MAX_CONCURRENT_JOBS_CONFIG = Number(process.env.MAX_CONCURRENT_JOBS ?? 1);
+const MAX_CONCURRENT_JOBS = Number.isSafeInteger(MAX_CONCURRENT_JOBS_CONFIG) && MAX_CONCURRENT_JOBS_CONFIG >= 1
+  ? MAX_CONCURRENT_JOBS_CONFIG
+  : 1;
 const PUBLIC_ORIGIN = process.env.PUBLIC_ORIGIN || '';
 const JOB_ENCRYPTION_KEY = process.env.JOB_ENCRYPTION_KEY || '';
 const REDIS_URL = String(process.env.REDIS_URL || '').trim();
@@ -423,6 +432,12 @@ async function cleanupInputs(manifest, abortOpen = true) {
   }
 }
 
+function normalizeIpaUrlInput(raw) {
+  let value = clampText(raw, 4096);
+  // Discord-style angle-wrapped links are common when embeds are suppressed.
+  if (value.startsWith('<') && value.endsWith('>')) value = value.slice(1, -1).trim();
+  return value;
+}
 function ipv6Words(address) {
   let value = String(address || '').toLowerCase();
   if (value.includes('.')) {
@@ -518,13 +533,30 @@ function remoteFilename(urlString, kind, requestedName = '') {
     const ext = path.extname(name).toLowerCase();
     return (kind === 'ipa' && ext === '.ipa') || (kind === 'certificate' && ['.p12','.pfx'].includes(ext)) || (kind === 'profile' && ext === '.mobileprovision');
   };
-  const requested = path.basename(clampText(requestedName, 240));
-  if (requested && !requested.includes('\0') && isAllowed(requested)) return requested;
+  // Treat names as URL/file labels, never as paths. Some CDNs encode slashes or
+  // provide the filename only in a query parameter on signed download links.
+  const safeCandidate = value => {
+    if (typeof value !== 'string' || !value) return '';
+    let decoded = value;
+    try { decoded = decodeURIComponent(decoded); } catch {}
+    const leaf = decoded.replace(/\\/g, '/').split('/').pop().replace(/[\x00-\x1f\x7f]/g, '').trim();
+    return leaf.slice(0, 240);
+  };
+  const requested = safeCandidate(clampText(requestedName, 240));
+  if (requested && isAllowed(requested)) return requested;
   try {
     const url = new URL(urlString);
-    const candidate = decodeURIComponent(path.basename(url.pathname));
-    if (candidate && !candidate.includes('\0') && isAllowed(candidate)) return candidate;
+    const pathCandidate = safeCandidate(url.pathname.split('/').pop() || '');
+    if (pathCandidate && isAllowed(pathCandidate)) return pathCandidate;
+    // Common object-storage/download endpoints expose the true filename in a
+    // query parameter even when the URL path is simply /download or /file.
+    for (const key of ['filename', 'file', 'name', 'download']) {
+      const candidate = safeCandidate(url.searchParams.get(key) || '');
+      if (candidate && isAllowed(candidate)) return candidate;
+    }
   } catch {}
+  // A direct public download URL need not end in .ipa (for example, /download?id=123).
+  // Keep a valid local extension so the signing pipeline works for any endpoint path.
   return fallback;
 }
 function makeRemoteUpload(kind, sourceUrl, requestedName = '') {
@@ -827,7 +859,7 @@ app.post(['/sign', '/api/v1/discord/sign'], authenticateApiClientAndApplyQuota, 
     if (!storageConfigured()) return res.status(503).json({success: false, ok: false, error: 'Tigris storage is not configured.'});
     if (!JOB_ENCRYPTION_KEY) return res.status(503).json({success: false, ok: false, error: 'Signing job encryption is not configured.'});
 
-    const rawIpaUrl = clampText(body.ipaUrl || body.ipa_url, 4096);
+    const rawIpaUrl = normalizeIpaUrlInput(body.ipaUrl || body.ipa_url);
     // ipaUrl is the only URL accepted for source material. Certificates and profiles must be uploaded files.
     if (body.p12Url || body.p12_url || body.certificateUrl || body.mobileprovisionUrl || body.mobileprovision_url || body.profileUrl || body.profile_url) {
       return res.status(400).json({success: false, ok: false, error: 'Only ipaUrl may be provided as a URL. Upload p12 and mobileprovision as files.'});
@@ -1374,12 +1406,12 @@ async function runSigningJob(id) {
       appendJobLog(manifest, `Found ${foundDylibs.length} dylib file(s) in the .deb package.`, 'system');
     }
     manifest.phase = 'signing'; manifest.progress = 70;
-    appendJobLog(manifest, 'Starting upstream zsign CLI (version 1.1.2 build target).', 'system');
+    appendJobLog(manifest, `Starting zsign 1.1.2 (IPA ZIP compression level ${ZSIGN_ZIP_LEVEL}; lower levels generally archive faster).`, 'system');
     await flushManifest(manifest);
     const output = path.join(workDir, 'signed.ipa');
     const args = ['-k', local.certificate];
     if (password.length > 0) args.push('-p', password);
-    args.push('-m', local.profile, '-o', output, '-z', '9', '-t', workDir, local.ipa);
+    args.push('-m', local.profile, '-o', output, '-z', String(ZSIGN_ZIP_LEVEL), '-t', workDir, local.ipa);
     if (manifest.settings?.bundleId) args.push('-b', manifest.settings.bundleId);
     if (manifest.settings?.bundleName) args.push('-n', manifest.settings.bundleName);
     if (manifest.settings?.bundleVersion) args.push('-r', manifest.settings.bundleVersion);
@@ -1629,7 +1661,7 @@ if (SHARED_QUEUE_ENABLED && process.env.RUN_SIGNING_WORKER !== 'false') {
 }
 if (!WORKER_ONLY) {
   server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(JSON.stringify({event: 'service_started', port: PORT, queue: SHARED_QUEUE_ENABLED ? 'bullmq' : 'in-process', worker: Boolean(sharedSigningWorker), storageConfigured: storageConfigured()}));
+    console.log(JSON.stringify({event: 'service_started', port: PORT, queue: SHARED_QUEUE_ENABLED ? 'bullmq' : 'in-process', worker: Boolean(sharedSigningWorker), maxConcurrentJobs: MAX_CONCURRENT_JOBS, zsignZipLevel: ZSIGN_ZIP_LEVEL, storageConfigured: storageConfigured()}));
     // With BullMQ the queue itself persists jobs and recovers stalled workers; local recovery is standalone-only.
     if (!SHARED_QUEUE_ENABLED) void recoverJobs({recoverInterruptedImmediately: true});
   });

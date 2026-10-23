@@ -19,6 +19,8 @@ services:
         value: /data
       - key: ZSIGN_BIN
         value: /usr/local/bin/zsign
+      - key: ZSIGN_ZIP_LEVEL
+        value: "1"
       - key: MAX_IPA_BYTES
         value: "4294967296"
       - key: MAX_CONCURRENT_JOBS

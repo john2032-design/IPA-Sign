@@ -9,7 +9,7 @@ RUN git clone --depth 1 --branch v${ZSIGN_VERSION} https://github.com/zhlynn/zsi
     && node /tmp/patch-zsign-progress.mjs /src/src/bundle.cpp \
     && cd build/linux \
     && make clean \
-    && make VERSION=${ZSIGN_VERSION} -j2 \
+    && make VERSION=${ZSIGN_VERSION} -j"$(nproc)" \
     && cd /src \
     && strip bin/zsign \
     && ./bin/zsign -v
@@ -31,6 +31,7 @@ RUN mkdir -p /data/work && chmod 0777 /data /data/work
 ENV NODE_ENV=production
 ENV DATA_DIR=/data
 ENV ZSIGN_BIN=/usr/local/bin/zsign
+ENV ZSIGN_ZIP_LEVEL=1
 ENV MAX_IPA_BYTES=4294967296
 ENV PART_SIZE_BYTES=67108864
 EXPOSE 10000

@@ -21,12 +21,12 @@ Everything else except `/doc` and `/doc/openapi.json` returns JSON 404. The only
 
 ## `POST /sign` multipart contract
 
-Use `Content-Type: multipart/form-data` (let `fetch`/`FormData` set its boundary). Supply the IPA as **one** of: `ipa` (file) or `ipaUrl` (public HTTPS URL). `ipaUrl` is the only URL-valued field; the certificate, provisioning profile, icon, and tweaks are files.
+Use `Content-Type: multipart/form-data` (let `fetch`/`FormData` set its boundary). Supply the IPA as **one** of: `ipa` (file) or `ipaUrl` (public HTTPS URL). `ipaUrl` is the only URL-valued field; the certificate, provisioning profile, icon, and tweaks are files. The URL may be a signed/query-based download endpoint and does not need to end in `.ipa`; the server follows safe HTTPS redirects and assigns a `.ipa` filename when the path has no filename.
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
 | `ipa` | file | One of `ipa` or `ipaUrl` | `.ipa`; 4 GiB default cap (`MAX_IPA_BYTES`) |
-| `ipaUrl` | string | One of `ipa` or `ipaUrl` | Direct public HTTPS URL accessible from Render without private login/session |
+| `ipaUrl` | string | One of `ipa` or `ipaUrl` | Direct public HTTPS download URL; may use query parameters or redirects and need not end in `.ipa`; must be accessible from Render without private login/session |
 | `p12` | file | yes | `.p12` or `.pfx`; alias `certificate` is supported for the supplied bot |
 | `mobileprovision` | file | yes | `.mobileprovision`; alias `profile` is supported |
 | `password` | text | no | Password for the P12; blank for unencrypted certificate |
@@ -86,6 +86,7 @@ Each object uses `key` (required), `limit` (optional positive integer), and `win
 - Optional PNG icon, app name, Bundle ID, and version override are forwarded to zsign. When not supplied, the service attempts to read metadata from the IPA.
 - Remote IPA downloads are streamed to a temporary file (not buffered whole in RAM), default cap 4 GiB and default timeout 60 minutes. DNS results are checked against conservative IPv4/IPv6 non-public/special-use ranges and pinned to the actual HTTPS connection to mitigate DNS rebinding. Every redirect is independently re-resolved, checked and pinned. A 401/403 from the source host means that host denied the request; choose a direct publicly accessible download URL or meet the file host's documented requirements.
 - Signing needs temporary local filesystem space for zsign's extraction, modifications, archive, and output. Tigris stores uploaded inputs and completed output, but does not substitute for the working directory required by zsign.
+- **Signing/archiving speed:** `ZSIGN_ZIP_LEVEL` defaults to `1` (faster archive creation than level `9` with modest compression). Set it to `0` for no compression and the fastest ZIP step, at the cost of a potentially larger IPA and a longer result upload; values `2`–`9` trade speed for size. If `MAX_CONCURRENT_JOBS` is unset, the service runs one signing job at a time to avoid CPU, memory, and scratch-disk contention. Raise concurrency only after measuring the worker.
 - Signed IPA result objects are deleted from Tigris after the configured `SIGNED_IPA_TTL_MINUTES` window (default 10 minutes, safely clamped to 1–60). Completion and URL responses expose exact expiration timestamps; signed download/OTA URLs cannot outlive that deadline. Input objects and certificate material are deleted after success/failure.
 
 ## Error responses and request tracing
