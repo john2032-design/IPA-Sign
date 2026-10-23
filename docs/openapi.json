@@ -1153,6 +1153,138 @@
           }
         }
       }
+    },
+    "/api/jobs/{jobId}/download/{token}": {
+      "get": {
+        "tags": [
+          "Results"
+        ],
+        "summary": "Stream a small Render-local signed IPA",
+        "description": "Tokenized URL normally returned in result.downloadUrl when a signed result is stored in Render-local temporary storage. The token expires with the result-retention deadline.",
+        "parameters": [
+          {
+            "name": "jobId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "token",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Signed IPA stream",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            }
+          },
+          "404": {
+            "description": "Download token invalid or result unavailable",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            }
+          },
+          "410": {
+            "description": "Signed IPA expired",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            }
+          },
+          "503": {
+            "description": "Signed IPA temporarily unavailable",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ota/{jobId}/{token}/signed.ipa": {
+      "get": {
+        "tags": [
+          "Results"
+        ],
+        "summary": "Stream a Render-local IPA for OTA installation",
+        "description": "Used by the OTA manifest only when the signed result is in Render-local temporary storage. The OTA token and result-retention deadline are validated.",
+        "parameters": [
+          {
+            "name": "jobId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "token",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Signed IPA stream",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            }
+          },
+          "404": {
+            "description": "Installation token invalid or result unavailable",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            }
+          },
+          "503": {
+            "description": "Signed IPA temporarily unavailable",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

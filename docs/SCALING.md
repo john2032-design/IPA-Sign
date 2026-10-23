@@ -48,13 +48,21 @@ AWS_ACCESS_KEY_ID=<same Tigris access key>
 AWS_SECRET_ACCESS_KEY=<same Tigris secret>
 JOB_ENCRYPTION_KEY=<same existing value as API service>
 MAX_IPA_BYTES=4294967296
-PART_SIZE_BYTES=67108864
+PART_SIZE_BYTES=16777216
+TIGRIS_UPLOAD_QUEUE_SIZE=4
+TIGRIS_OBJECT_TRANSFER_CONCURRENCY=2
+TIGRIS_PARALLEL_DOWNLOAD_THRESHOLD_BYTES=67108864
+TIGRIS_DOWNLOAD_CHUNK_SIZE_BYTES=33554432
+TIGRIS_DOWNLOAD_CONCURRENCY=4
+LOCAL_IPA_THRESHOLD_BYTES=536870912
+LOCAL_IPA_DIR=/tmp/xsigner-local-ipa
+LOCAL_RESULT_DIR=/tmp/xsigner-local-results
 MAX_CONCURRENT_JOBS=1
 SIGN_TIMEOUT_MS=3600000
 REMOTE_FETCH_TIMEOUT_MS=3600000
 ```
 
-Workers do not listen on HTTP ports. Their local work directory is scratch space; uploaded assets, manifests and signed results live in Tigris. Keep `MAX_CONCURRENT_JOBS` conservative because each zsign job can require several times the source IPA's size in working storage.
+Workers do not listen on HTTP ports. Their local work directory is scratch space; uploaded assets, manifests and signed results that must be shared across API/worker instances live in Tigris. The 512 MiB Render-local tier is deliberately used only when the process can access the same local files; shared API/worker mode routes multipart uploads and signed results through Tigris. URL sources are fetched by the worker and oversized URL IPAs are staged to Tigris after their actual size is known. `/tmp` is ephemeral filesystem storage, not literal RAM, and files there may disappear on restarts. Keep `MAX_CONCURRENT_JOBS` conservative because each zsign job can require several times the source IPA's size in working storage.
 
 ## Safety checklist before adding replicas
 
@@ -74,3 +82,9 @@ This optional mode does not add an idempotency key or cancellation endpoint. It 
 The API defaults `ZSIGN_ZIP_LEVEL=1` instead of zsign's maximum compression level. This is a faster speed/size balance for IPA output. Set `ZSIGN_ZIP_LEVEL=0` for the fastest archive step with no ZIP compression (the resulting IPA can be larger and take longer to upload); use `2`–`9` when output size matters more than signing latency. Values outside `0`–`9` safely fall back to `1`.
 
 `MAX_CONCURRENT_JOBS` defaults to `1` when unset so CPU-heavy zsign jobs do not accidentally compete for the same cores and scratch disk. Increase it only after measuring CPU, memory, and disk throughput on the actual worker; more concurrent jobs improve aggregate throughput in some cases but can make each job slower or cause out-of-space/OOM failures. The Docker build compiles zsign using all available build CPUs to reduce image-build time.
+
+## Tigris transfer tuning
+
+Large object uploads use multipart transfer with a 16 MiB part size and up to 4 concurrent parts by default. The API also starts up to 2 distinct input-object transfers at once. Worker downloads of known-size objects at least 64 MiB use HTTP byte ranges (32 MiB chunks, up to 4 concurrent range reads) written directly to the worker's temporary file; this avoids buffering the full IPA in RAM. The implementation checks HTTP 206 responses, expected range boundaries when supplied, received byte counts, and final file size.
+
+Tune `LOCAL_IPA_THRESHOLD_BYTES` (default 512 MiB), `TIGRIS_UPLOAD_QUEUE_SIZE` (1–8), `TIGRIS_OBJECT_TRANSFER_CONCURRENCY` (1–4), `TIGRIS_DOWNLOAD_CHUNK_SIZE_BYTES` (5 MiB–1 GiB), `TIGRIS_DOWNLOAD_CONCURRENCY` (1–8), `TIGRIS_PARALLEL_DOWNLOAD_THRESHOLD_BYTES`, and `PART_SIZE_BYTES` using actual transfer logs. Higher concurrency can improve throughput on a healthy network path but increases memory, socket, and storage pressure. If range requests fail in your environment, inspect the returned error and temporarily raise `TIGRIS_PARALLEL_DOWNLOAD_THRESHOLD_BYTES` above your largest IPA to use the streaming single-GET fallback. Large final IPA downloads use presigned Tigris URLs directly, so client-to-Tigris speed depends on the client network and Tigris's nearest serving path. Small local-tier results stream through the API via an expiring signed token.
