@@ -23,6 +23,12 @@ services:
         value: "1"
       - key: MAX_IPA_BYTES
         value: "4294967296"
+      - key: LOCAL_IPA_THRESHOLD_BYTES
+        value: "536870912"
+      - key: LOCAL_IPA_DIR
+        value: /tmp/xsigner-local-ipa
+      - key: LOCAL_RESULT_DIR
+        value: /tmp/xsigner-local-results
       - key: MAX_CONCURRENT_JOBS
         value: "1"
       - key: API_SIGN_RATE_LIMIT
@@ -34,7 +40,17 @@ services:
       - key: API_SIGN_AUTHENTICATED_IP_LIMIT
         value: "300"
       - key: PART_SIZE_BYTES
+        value: "16777216"
+      - key: TIGRIS_UPLOAD_QUEUE_SIZE
+        value: "4"
+      - key: TIGRIS_OBJECT_TRANSFER_CONCURRENCY
+        value: "2"
+      - key: TIGRIS_PARALLEL_DOWNLOAD_THRESHOLD_BYTES
         value: "67108864"
+      - key: TIGRIS_DOWNLOAD_CHUNK_SIZE_BYTES
+        value: "33554432"
+      - key: TIGRIS_DOWNLOAD_CONCURRENCY
+        value: "4"
       - key: JOB_TTL_HOURS
         value: "24"
       - key: UPLOAD_TTL_HOURS
