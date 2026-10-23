@@ -25,7 +25,7 @@ for (const section of ['id="quick-start"','id="fields"','id="lifecycle"','id="en
 for (const field of ['ipaUrl','mobileprovision','certificate','profile','bundleId','bundleVersion','injectExtensions','tweaks','downloadUrl','otaUrl','429','503','403']) {
   assert(html.includes(field), `Documentation is missing field/topic ${field}`);
 }
-for (const route of ['/sign','/api/v1/discord/sign','/api/jobs/{jobId}','/api/jobs/{jobId}/download-url','/api/jobs/{jobId}/ota-url','/ota/{jobId}/{token}/manifest.plist','/health','/api/v1/discord/health']) {
+for (const route of ['/sign','/api/v1/discord/sign','/api/jobs/{jobId}','/api/jobs/{jobId}/download-url','/api/jobs/{jobId}/download/{token}','/api/jobs/{jobId}/ota-url','/ota/{jobId}/{token}/manifest.plist','/ota/{jobId}/{token}/signed.ipa','/health','/api/v1/discord/health']) {
   assert(openapi.paths[route], `OpenAPI document is missing ${route}`);
 }
 assert(openapi.info.version && openapi.openapi === '3.1.0', 'OpenAPI metadata is invalid');
