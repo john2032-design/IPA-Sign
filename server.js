@@ -31,20 +31,11 @@ const PORT = Number(process.env.PORT || 10000);
 const ROOT = process.env.DATA_DIR || '/tmp/xsigner-data';
 const WORK_ROOT = path.join(ROOT, 'work');
 const MANIFEST_ROOT = path.join(ROOT, 'manifests');
-// Small IPA source files and results use Render-local ephemeral storage instead of Tigris.
-// Stream to files rather than retaining a 512 MiB Buffer in Node's heap.
-const LOCAL_IPA_ROOT = process.env.LOCAL_IPA_DIR || path.join('/tmp', 'xsigner-local-ipa');
-const LOCAL_RESULT_ROOT = process.env.LOCAL_RESULT_DIR || path.join('/tmp', 'xsigner-local-results');
 const SIGNER = process.env.ZSIGN_BIN || '/usr/local/bin/zsign';
 const BUCKET = process.env.S3_BUCKET || process.env.TIGRIS_BUCKET || '';
 const REGION = process.env.AWS_REGION || 'auto';
 const ENDPOINT = process.env.AWS_ENDPOINT_URL_S3 || process.env.AWS_ENDPOINT_URL || 'https://t3.storage.dev';
 const MAX_IPA_BYTES = Number(process.env.MAX_IPA_BYTES || 4294967296);
-const DEFAULT_LOCAL_IPA_THRESHOLD_BYTES = 512 * 1024 * 1024;
-const LOCAL_IPA_THRESHOLD_CONFIG = Number(process.env.LOCAL_IPA_THRESHOLD_BYTES ?? DEFAULT_LOCAL_IPA_THRESHOLD_BYTES);
-const LOCAL_IPA_THRESHOLD_BYTES = Number.isSafeInteger(LOCAL_IPA_THRESHOLD_CONFIG) && LOCAL_IPA_THRESHOLD_CONFIG >= 1 && LOCAL_IPA_THRESHOLD_CONFIG <= MAX_IPA_BYTES
-  ? LOCAL_IPA_THRESHOLD_CONFIG
-  : Math.min(DEFAULT_LOCAL_IPA_THRESHOLD_BYTES, MAX_IPA_BYTES);
 const MAX_SMALL_FILE_BYTES = 16 * 1024 * 1024;
 const DEFAULT_TIGRIS_PART_SIZE_BYTES = 16 * 1024 * 1024;
 const PART_SIZE_CONFIG = Number(process.env.PART_SIZE_BYTES ?? DEFAULT_TIGRIS_PART_SIZE_BYTES);
@@ -127,8 +118,7 @@ const apiSignStorage = {
       file.stream.resume();
       return callback(Object.assign(new Error(`Unexpected file field: ${field}`), {status: 400}));
     }
-    const uploadRoot = field === 'ipa' ? LOCAL_IPA_ROOT : WORK_ROOT;
-    const filePath = path.join(uploadRoot, `discord-api-${crypto.randomUUID()}`);
+    const filePath = path.join(WORK_ROOT, `discord-api-${crypto.randomUUID()}`);
     let size = 0;
     const limiter = new Transform({transform(chunk, _encoding, done) {
       size += chunk.length;
@@ -172,8 +162,6 @@ function handleApiSignUpload(req, res, next) {
 }
 
 await fsp.mkdir(WORK_ROOT, {recursive: true});
-await fsp.mkdir(LOCAL_IPA_ROOT, {recursive: true, mode: 0o700});
-await fsp.mkdir(LOCAL_RESULT_ROOT, {recursive: true, mode: 0o700});
 await fsp.mkdir(MANIFEST_ROOT, {recursive: true, mode: 0o700});
 
 app.disable('x-powered-by');
@@ -318,25 +306,6 @@ function decryptPassword(data) {
 function validateId(id) { return typeof id === 'string' && /^[0-9a-f-]{36}$/i.test(id); }
 function clampText(value, max) { return typeof value === 'string' ? value.trim().slice(0, max) : ''; }
 function formatBytesSafe(bytes) { const n = Math.max(0, Number(bytes) || 0); if (n < 1024) return `${n} B`; if (n < 1024 ** 2) return `${(n/1024).toFixed(1)} KB`; if (n < 1024 ** 3) return `${(n/1024**2).toFixed(1)} MB`; return `${(n/1024**3).toFixed(2)} GB`; }
-function isPathWithin(candidate, root) {
-  const resolvedCandidate = path.resolve(candidate || '');
-  const resolvedRoot = path.resolve(root || '');
-  return resolvedCandidate !== resolvedRoot && resolvedCandidate.startsWith(`${resolvedRoot}${path.sep}`);
-}
-function safeLocalInputPath(candidate) {
-  const resolved = path.resolve(String(candidate || ''));
-  return [LOCAL_IPA_ROOT, WORK_ROOT].some(root => isPathWithin(resolved, root)) ? resolved : '';
-}
-function safeLocalResultPath(manifest) {
-  if (!manifest?.resultPath || !validateId(manifest.id)) return '';
-  const resolved = path.resolve(String(manifest.resultPath));
-  if (!isPathWithin(resolved, LOCAL_RESULT_ROOT) || path.basename(resolved) !== `${manifest.id}.ipa`) return '';
-  return resolved;
-}
-function localResultToken(id, expiresAt) {
-  const key = crypto.createHash('sha256').update(JOB_ENCRYPTION_KEY).digest();
-  return crypto.createHmac('sha256', key).update(`local-result:${id}:${Number(expiresAt)}`).digest('base64url');
-}
 function messageOf(error) { return String(error?.message || 'Unexpected error').slice(0, 700); }
 function storageErrorForUser(_error) { return 'Object storage is temporarily unavailable. Please retry shortly.'; }
 function isManifestKey(key) { return typeof key === 'string' && key.startsWith('jobs/') && key.endsWith('/manifest.json'); }
@@ -454,50 +423,29 @@ async function removeObject(key) {
   catch (error) { console.warn(JSON.stringify({event: 'tigris_object_cleanup_failed', keyPrefix: String(key).split('/').slice(0, 2).join('/'), code: error?.Code || error?.code || null, status: error?.$metadata?.httpStatusCode || null, message: safeTerminalLine(messageOf(error)).slice(0, 250)})); }
 }
 async function expireSignedResultIfNeeded(manifest) {
-  if (!manifest || manifest.status !== 'completed' || (!manifest.resultKey && !manifest.resultPath)) return Boolean(manifest?.resultDeletedAt);
+  if (!manifest || manifest.status !== 'completed' || !manifest.resultKey) return Boolean(manifest?.resultDeletedAt);
   const completedAt = Number(manifest.completedAt || manifest.updatedAt || 0);
   const expiresAt = Number(manifest.resultExpiresAt || (completedAt + SIGNED_IPA_RETENTION_MS));
   if (!expiresAt || Date.now() < expiresAt) return false;
-  const expiredFromLocal = Boolean(manifest.resultPath);
-  if (manifest.resultPath) {
-    const localPath = safeLocalResultPath(manifest);
-    if (!localPath) {
-      console.warn(JSON.stringify({event: 'local_signed_result_path_rejected', jobId: manifest.id}));
-      return false;
-    }
-    try { await fsp.rm(localPath, {force: true}); }
-    catch (error) {
-      console.warn(JSON.stringify({event: 'local_signed_result_expiry_delete_failed', jobId: manifest.id, message: safeTerminalLine(messageOf(error)).slice(0, 250)}));
-      return false;
-    }
-    manifest.resultPath = null;
-  } else {
-    const expiredKey = manifest.resultKey;
-    try {
-      // Only mark a remote result deleted after object storage confirms deletion.
-      await getS3().send(new DeleteObjectCommand({Bucket: BUCKET, Key: expiredKey}));
-    } catch (error) {
-      console.warn(JSON.stringify({event: 'tigris_signed_result_expiry_delete_failed', jobId: manifest.id, code: error?.Code || error?.code || null, status: error?.$metadata?.httpStatusCode || null, message: safeTerminalLine(messageOf(error)).slice(0, 250)}));
-      return false;
-    }
-    manifest.resultKey = null;
+  const expiredKey = manifest.resultKey;
+  try {
+    // Tigris supports the S3 DeleteObject operation. Only mark the result deleted after the API succeeds.
+    await getS3().send(new DeleteObjectCommand({Bucket: BUCKET, Key: expiredKey}));
+  } catch (error) {
+    console.warn(JSON.stringify({event: 'tigris_signed_result_expiry_delete_failed', jobId: manifest.id, code: error?.Code || error?.code || null, status: error?.$metadata?.httpStatusCode || null, message: safeTerminalLine(messageOf(error)).slice(0, 250)}));
+    return false;
   }
+  manifest.resultKey = null;
   manifest.resultDeletedAt = Date.now();
   manifest.resultExpiresAt = expiresAt;
-  appendJobLog(manifest, `The signed IPA was automatically deleted from ${expiredFromLocal ? 'Render-local storage' : 'Tigris'} after ${SIGNED_IPA_RETENTION_MINUTES} minutes.`, 'system');
-  await flushManifest(manifest).catch(error => console.warn(JSON.stringify({event: 'signed_result_expiry_manifest_persist_failed', jobId: manifest.id, message: safeTerminalLine(messageOf(error)).slice(0, 250)})));
+  appendJobLog(manifest, `The signed IPA was automatically deleted from Tigris after ${SIGNED_IPA_RETENTION_MINUTES} minutes.`, 'system');
+  await flushManifest(manifest).catch(error => console.warn(JSON.stringify({event: 'tigris_expiry_manifest_persist_failed', jobId: manifest.id, message: safeTerminalLine(messageOf(error)).slice(0, 250)})));
   return true;
 }
 async function cleanupInputs(manifest, abortOpen = true) {
   const client = getS3();
   for (const upload of Object.values(manifest.uploads || {})) {
-    if (!upload) continue;
-    if (upload.localPath) {
-      const localPath = safeLocalInputPath(upload.localPath);
-      if (localPath) await fsp.rm(localPath, {force: true}).catch(() => {});
-      upload.localPath = null;
-    }
-    if (!upload.key) continue;
+    if (!upload || !upload.key) continue;
     if (abortOpen && upload.uploadId && !upload.completed) {
       try { await client.send(new AbortMultipartUploadCommand({Bucket: BUCKET, Key: upload.key, UploadId: upload.uploadId})); }
       catch (error) { /* The multipart upload may already have expired or completed. */ }
@@ -636,23 +584,7 @@ function remoteFilename(urlString, kind, requestedName = '') {
 }
 function makeRemoteUpload(kind, sourceUrl, requestedName = '') {
   const maxBytes = ({ipa: MAX_IPA_BYTES, certificate: MAX_SMALL_FILE_BYTES, profile: MAX_SMALL_FILE_BYTES})[kind];
-  return {key: null, uploadId: null, filename: remoteFilename(sourceUrl, kind, requestedName), contentType: 'application/octet-stream', expectedSize: null, partCount: 0, completed: true, actualSize: null, remote: true, storage: 'remote-url', sourceUrl, maxBytes};
-}
-async function uploadLocalFileToTigris({id, kind, filePath, filename, contentType = 'application/octet-stream'}) {
-  const info = await fsp.stat(filePath);
-  if (!info.isFile() || info.size < 1) throw new Error(`Cannot upload an empty or unavailable ${kind} file to Tigris.`);
-  const extension = path.extname(filename || '').toLowerCase() || (kind === 'ipa' ? '.ipa' : '');
-  const key = `uploads/${id}/${kind}${extension}`;
-  const uploader = new Upload({
-    client: getS3(),
-    params: {
-      Bucket: BUCKET, Key: key, Body: fs.createReadStream(filePath), ContentLength: info.size,
-      ContentType: contentType, Metadata: {jobid: id, kind, source: 'api-or-url'}
-    },
-    queueSize: TIGRIS_UPLOAD_QUEUE_SIZE, partSize: PART_SIZE, leavePartsOnError: false
-  });
-  await uploader.done();
-  return {key, size: info.size, contentType};
+  return {key: null, uploadId: null, filename: remoteFilename(sourceUrl, kind, requestedName), contentType: 'application/octet-stream', expectedSize: null, partCount: 0, completed: true, actualSize: null, remote: true, sourceUrl, maxBytes};
 }
 async function downloadRemoteToFile(rawUrl, destination, maxBytes, onProgress = () => {}) {
   let currentUrl = rawUrl;
@@ -942,7 +874,6 @@ app.post(['/sign', '/api/v1/discord/sign'], authenticateApiClientAndApplyQuota, 
   const debFile = file('deb') || legacyTweaks.find(item => path.extname(item.originalname || '').toLowerCase() === '.deb') || null;
   const dylibFile = file('dylib') || legacyTweaks.find(item => path.extname(item.originalname || '').toLowerCase() === '.dylib') || null;
   const localApiFiles = Object.values(files).flat().filter(Boolean);
-  const retainedLocalInputPaths = new Set();
   let manifest = null;
   let password = '';
   let submissionStage = 'validation';
@@ -995,25 +926,13 @@ app.post(['/sign', '/api/v1/discord/sign'], authenticateApiClientAndApplyQuota, 
       error: null, logs: [], logSequence: 0, otaTokenHash: null, otaExpiresAt: null, otaMetadata: null
     };
 
-    const keepUploadedIpaLocal = Boolean(!SHARED_QUEUE_ENABLED && !ipaUrl && ipaFile && ipaFile.size <= LOCAL_IPA_THRESHOLD_BYTES);
     if (ipaUrl) {
       manifest.uploads.ipa = makeRemoteUpload('ipa', ipaUrl);
-      appendJobLog(manifest, `API request accepted. IPA will be fetched from the supplied public HTTPS URL; files at or below ${formatBytesSafe(LOCAL_IPA_THRESHOLD_BYTES)} stay in Render-local workspace, while larger files are staged in Tigris.`, 'system');
-    } else if (keepUploadedIpaLocal) {
-      const localPath = path.resolve(ipaFile.path);
-      if (!safeLocalInputPath(localPath)) throw Object.assign(new Error('Uploaded IPA temporary path is outside the configured local upload directory.'), {status: 500});
-      manifest.uploads.ipa = {
-        key: null, uploadId: null, filename: path.basename(ipaFile.originalname).slice(0, 240),
-        contentType: ipaFile.mimetype || 'application/octet-stream', expectedSize: ipaFile.size,
-        partCount: 0, completed: true, actualSize: ipaFile.size, remote: false,
-        storage: 'render-local', localPath
-      };
-      retainedLocalInputPaths.add(localPath);
-      appendJobLog(manifest, `IPA (${formatBytesSafe(ipaFile.size)}) is stored in Render-local scratch storage; it will not be uploaded to Tigris.`, 'system');
+      appendJobLog(manifest, 'API request accepted. IPA will be fetched from the supplied public HTTPS URL.', 'system');
     }
     const uploadMap = [
       [p12File, 'certificate'], [profileFile, 'profile'], [iconFile, 'icon'], [debFile, 'deb'], [dylibFile, 'dylib'],
-      ...(!ipaUrl && ipaFile && !keepUploadedIpaLocal ? [[ipaFile, 'ipa']] : [])
+      ...(!ipaUrl && ipaFile ? [[ipaFile, 'ipa']] : [])
     ];
     submissionStage = ipaUrl ? 'remote_ipa_registration' : 'upload_inputs';
     const inputUploadEntries = uploadMap.filter(([source]) => Boolean(source)).sort((a, b) => Number(b[0].size || 0) - Number(a[0].size || 0));
@@ -1038,7 +957,7 @@ app.post(['/sign', '/api/v1/discord/sign'], authenticateApiClientAndApplyQuota, 
         await uploader.done();
         manifest.uploads[kind] = {
           key, uploadId: null, filename: path.basename(source.originalname).slice(0, 240),
-          contentType, expectedSize: source.size, partCount: 0, completed: true, actualSize: source.size, remote: false, storage: 'tigris'
+          contentType, expectedSize: source.size, partCount: 0, completed: true, actualSize: source.size, remote: false
         };
         const elapsedMs = Math.max(1, Date.now() - transferStartedAt);
         const mibPerSecond = source.size / (1024 * 1024) / (elapsedMs / 1000);
@@ -1074,10 +993,8 @@ app.post(['/sign', '/api/v1/discord/sign'], authenticateApiClientAndApplyQuota, 
       message: safeTerminalLine(messageOf(error), password).slice(0, 400)
     }));
     if (manifest) {
-      await cleanupInputs(manifest, true).catch(() => {});
+      for (const upload of Object.values(manifest.uploads || {})) if (upload?.key) await removeObject(upload.key);
       if (manifest.resultKey) await removeObject(manifest.resultKey);
-      const failedLocalResultPath = safeLocalResultPath(manifest);
-      if (failedLocalResultPath) await fsp.rm(failedLocalResultPath, {force: true}).catch(() => {});
       if (!isLocalManifestStorage()) await removeObject(s3KeyForManifest(manifest.id));
       manifest.passwordCipher = null;
       await fsp.rm(localManifestPath(manifest.id), {force: true}).catch(() => {});
@@ -1086,7 +1003,7 @@ app.post(['/sign', '/api/v1/discord/sign'], authenticateApiClientAndApplyQuota, 
     if (!res.headersSent) return res.status(error?.status || 503).json({success: false, ok: false, error: error?.status ? messageOf(error) : 'Could not queue the signing request. Check object storage and encryption configuration.'});
   } finally {
     password = '';
-    await Promise.all(localApiFiles.filter(source => !retainedLocalInputPaths.has(path.resolve(source.path))).map(source => fsp.rm(source.path, {force: true}).catch(() => {})));
+    await Promise.all(localApiFiles.map(source => fsp.rm(source.path, {force: true}).catch(() => {})));
   }
 });
 
@@ -1100,7 +1017,7 @@ async function buildApiCompletionResult(manifest, req) {
     resultExpiresAtMs: Number(manifest.resultExpiresAt || (Number(manifest.completedAt || Date.now()) + SIGNED_IPA_RETENTION_MS))
   };
   await expireSignedResultIfNeeded(manifest);
-  if (!manifest.resultKey && !manifest.resultPath) {
+  if (!manifest.resultKey) {
     result.error = 'The signed IPA has expired or is unavailable.';
     return result;
   }
@@ -1111,23 +1028,15 @@ async function buildApiCompletionResult(manifest, req) {
     return result;
   }
   try {
-    const origin = (PUBLIC_ORIGIN || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '');
-    let downloadUrl;
-    if (manifest.resultPath) {
-      const localPath = safeLocalResultPath(manifest);
-      if (!localPath || !fs.existsSync(localPath)) throw new Error('Render-local signed result is missing.');
-      downloadUrl = `${origin}/api/jobs/${manifest.id}/download/${localResultToken(manifest.id, expiresAt)}`;
-    } else {
-      downloadUrl = await getSignedUrl(getS3(), new GetObjectCommand({
-        Bucket: BUCKET, Key: manifest.resultKey,
-        ResponseContentDisposition: 'attachment; filename="signed.ipa"',
-        ResponseContentType: 'application/octet-stream'
-      }), {expiresIn: Math.max(1, Math.min(600, remainingSeconds))});
-    }
+    const downloadUrl = await getSignedUrl(getS3(), new GetObjectCommand({
+      Bucket: BUCKET, Key: manifest.resultKey,
+      ResponseContentDisposition: 'attachment; filename="signed.ipa"',
+      ResponseContentType: 'application/octet-stream'
+    }), {expiresIn: Math.max(1, Math.min(600, remainingSeconds))});
     result.downloadUrl = downloadUrl;
     result.download_url = downloadUrl;
   } catch (error) {
-    console.warn('Signed IPA completion download URL failed:', messageOf(error));
+    console.warn('Discord API completion download URL failed:', messageOf(error));
   }
   if (!result.bundleId) {
     result.otaError = 'Could not determine the app Bundle ID. Supply bundleId to enable OTA installation.';
@@ -1176,64 +1085,25 @@ app.get('/api/jobs/:id', pollLimiter, async (req, res) => {
   res.set('Cache-Control', 'no-store').json(response);
 });
 
-app.get('/api/jobs/:id/download/:token', async (req, res) => {
-  const {id, token} = req.params;
-  if (!validateId(id)) return res.status(404).type('text').send('Not found');
-  try {
-    const manifest = await maybeManifest(id);
-    if (!manifest || manifest.status !== 'completed' || !manifest.resultPath) return res.status(404).type('text').send('Signed IPA unavailable');
-    await expireSignedResultIfNeeded(manifest);
-    if (!manifest.resultPath) return res.status(410).type('text').send('Signed IPA expired');
-    const expiresAt = Number(manifest.resultExpiresAt || 0);
-    if (!expiresAt || Date.now() >= expiresAt || !tokenMatches(token, hashToken(localResultToken(id, expiresAt)).toString('hex'))) {
-      return res.status(404).type('text').send('Download link expired or unavailable');
-    }
-    const localPath = safeLocalResultPath(manifest);
-    if (!localPath) return res.status(404).type('text').send('Signed IPA unavailable');
-    const stat = await fsp.stat(localPath).catch(() => null);
-    if (!stat?.isFile()) return res.status(410).type('text').send('Signed IPA expired or unavailable');
-    res.set({
-      'Content-Type': 'application/octet-stream',
-      'Content-Length': String(stat.size),
-      'Content-Disposition': 'attachment; filename=\"signed.ipa\"',
-      'Cache-Control': 'private, no-store'
-    });
-    const stream = fs.createReadStream(localPath);
-    stream.on('error', error => { if (!res.headersSent) res.status(500).end('Could not read signed IPA'); else res.destroy(error); });
-    stream.pipe(res);
-  } catch (error) {
-    console.warn(JSON.stringify({event: 'local_signed_result_download_failed', jobId: id, message: safeTerminalLine(messageOf(error)).slice(0, 250)}));
-    if (!res.headersSent) res.status(503).type('text').send('Signed IPA temporarily unavailable');
-  }
-});
-
 app.post('/api/jobs/:id/download-url', actionLimiter, async (req, res) => {
   const manifest = await authorizedJob(req, res, req.params.id);
   if (!manifest) return;
   if (manifest.status !== 'completed') return res.status(409).json({error: 'Signed IPA is not ready yet.'});
   await expireSignedResultIfNeeded(manifest);
-  if (!manifest.resultKey && !manifest.resultPath) return res.status(410).json({error: `This signed IPA expired and was deleted after ${SIGNED_IPA_RETENTION_MINUTES} minutes. Sign the app again to create a new download.`});
+  if (!manifest.resultKey) return res.status(410).json({error: `This signed IPA expired and was deleted after ${SIGNED_IPA_RETENTION_MINUTES} minutes. Sign the app again to create a new download.`});
   const remainingSeconds = Math.floor((Number(manifest.resultExpiresAt || (Number(manifest.completedAt || Date.now()) + SIGNED_IPA_RETENTION_MS)) - Date.now()) / 1000);
   if (remainingSeconds < 1) return res.status(410).json({error: 'This signed IPA has expired. Sign the app again to create a new download.'});
-  const expiresIn = manifest.resultPath ? Math.max(1, remainingSeconds) : Math.max(1, Math.min(600, remainingSeconds));
+  const expiresIn = Math.max(1, Math.min(600, remainingSeconds));
   try {
-    let url;
-    if (manifest.resultPath) {
-      const localPath = safeLocalResultPath(manifest);
-      if (!localPath || !fs.existsSync(localPath)) return res.status(410).json({error: 'The Render-local signed IPA is unavailable. Sign the app again.'});
-      const origin = (PUBLIC_ORIGIN || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '');
-      url = `${origin}/api/jobs/${manifest.id}/download/${localResultToken(manifest.id, Number(manifest.resultExpiresAt))}`;
-    } else {
-      url = await getSignedUrl(getS3(), new GetObjectCommand({
-        Bucket: BUCKET, Key: manifest.resultKey,
-        ResponseContentDisposition: 'attachment; filename="signed.ipa"',
-        ResponseContentType: 'application/octet-stream'
-      }), {expiresIn});
-    }
+    const url = await getSignedUrl(getS3(), new GetObjectCommand({
+      Bucket: BUCKET, Key: manifest.resultKey,
+      ResponseContentDisposition: 'attachment; filename="signed.ipa"',
+      ResponseContentType: 'application/octet-stream'
+    }), {expiresIn});
     const expiresAtMs = Date.now() + expiresIn * 1000;
     res.set('Cache-Control', 'no-store').json({url, expiresIn, expiresAt: new Date(expiresAtMs).toISOString(), expiresAtMs});
   } catch (error) {
-    console.error(JSON.stringify({event: 'signed_result_download_url_failed', requestId: req.requestId || null, jobId: manifest.id, message: safeTerminalLine(messageOf(error)).slice(0, 300), code: error?.Code || error?.code || null, status: error?.$metadata?.httpStatusCode || null}));
+    console.error(JSON.stringify({event: 'tigris_download_presign_failed', requestId: req.requestId || null, jobId: manifest.id, message: safeTerminalLine(messageOf(error)).slice(0, 300), code: error?.Code || error?.code || null, status: error?.$metadata?.httpStatusCode || null}));
     res.status(503).json({error: 'Could not create the download link. Check object storage configuration and try again shortly.'});
   }
 });
@@ -1243,7 +1113,7 @@ app.post('/api/jobs/:id/ota-url', actionLimiter, async (req, res) => {
   if (!manifest) return;
   if (manifest.status !== 'completed') return res.status(409).json({error: 'Signed IPA is not ready for OTA installation.'});
   await expireSignedResultIfNeeded(manifest);
-  if (!manifest.resultKey && !manifest.resultPath) return res.status(410).json({error: `This signed IPA expired and was deleted after ${SIGNED_IPA_RETENTION_MINUTES} minutes. Sign the app again for a new OTA link.`});
+  if (!manifest.resultKey) return res.status(410).json({error: `This signed IPA expired and was deleted after ${SIGNED_IPA_RETENTION_MINUTES} minutes. Sign the app again for a new OTA link.`});
   const metadata = manifest.otaMetadata || {};
   if (!metadata.bundleId) return res.status(409).json({error: 'Could not determine the app Bundle ID. Add a Bundle ID in Advanced options and sign again to enable OTA installation.'});
   try {
@@ -1261,35 +1131,8 @@ app.post('/api/jobs/:id/ota-url', actionLimiter, async (req, res) => {
       expiresAt: new Date(manifest.otaExpiresAt).toISOString(), expiresAtMs: manifest.otaExpiresAt
     });
   } catch (error) {
-    console.error(JSON.stringify({event: 'ota_link_generation_failed', requestId: req.requestId || null, jobId: manifest.id, message: safeTerminalLine(messageOf(error)).slice(0, 300), code: error?.Code || error?.code || null, status: error?.$metadata?.httpStatusCode || null}));
+    console.error(JSON.stringify({event: 'tigris_ota_link_generation_failed', requestId: req.requestId || null, jobId: manifest.id, message: safeTerminalLine(messageOf(error)).slice(0, 300), code: error?.Code || error?.code || null, status: error?.$metadata?.httpStatusCode || null}));
     res.status(503).json({error: 'Could not create the OTA installation link.'});
-  }
-});
-
-app.get('/ota/:id/:token/signed.ipa', async (req, res) => {
-  const {id, token} = req.params;
-  if (!validateId(id)) return res.status(404).type('text').send('Not found');
-  try {
-    const manifest = await maybeManifest(id);
-    if (!manifest || manifest.status !== 'completed' || !manifest.resultPath || !manifest.otaTokenHash || !tokenMatches(token, manifest.otaTokenHash) || Date.now() > Number(manifest.otaExpiresAt || 0)) {
-      return res.status(404).type('text').send('Installation link expired or unavailable');
-    }
-    await expireSignedResultIfNeeded(manifest);
-    if (!manifest.resultPath) return res.status(404).type('text').send('Signed IPA expired and was deleted');
-    const localPath = safeLocalResultPath(manifest);
-    if (!localPath) return res.status(404).type('text').send('Signed IPA unavailable');
-    const stat = await fsp.stat(localPath).catch(() => null);
-    if (!stat?.isFile()) return res.status(404).type('text').send('Signed IPA unavailable');
-    res.set({
-      'Content-Type': 'application/octet-stream', 'Content-Length': String(stat.size),
-      'Content-Disposition': 'attachment; filename=\"signed.ipa\"', 'Cache-Control': 'private, no-store'
-    });
-    const stream = fs.createReadStream(localPath);
-    stream.on('error', error => { if (!res.headersSent) res.status(500).end('Could not read signed IPA'); else res.destroy(error); });
-    stream.pipe(res);
-  } catch (error) {
-    console.warn(JSON.stringify({event: 'local_ota_ipa_download_failed', jobId: id, message: safeTerminalLine(messageOf(error)).slice(0, 250)}));
-    if (!res.headersSent) res.status(503).type('text').send('Signed IPA temporarily unavailable');
   }
 });
 
@@ -1298,24 +1141,16 @@ app.get('/ota/:id/:token/manifest.plist', async (req, res) => {
   if (!validateId(id)) return res.status(404).type('text').send('Not found');
   try {
     const manifest = await maybeManifest(id);
-    if (!manifest || manifest.status !== 'completed' || (!manifest.resultKey && !manifest.resultPath) || !manifest.otaTokenHash || !tokenMatches(token, manifest.otaTokenHash) || Date.now() > Number(manifest.otaExpiresAt || 0)) {
+    if (!manifest || manifest.status !== 'completed' || !manifest.resultKey || !manifest.otaTokenHash || !tokenMatches(token, manifest.otaTokenHash) || Date.now() > Number(manifest.otaExpiresAt || 0)) {
       return res.status(404).type('text').send('Installation link expired or unavailable');
     }
     await expireSignedResultIfNeeded(manifest);
-    if (!manifest.resultKey && !manifest.resultPath) return res.status(404).type('text').send('Signed IPA expired and was deleted');
+    if (!manifest.resultKey) return res.status(404).type('text').send('Signed IPA expired and was deleted');
     const metadata = manifest.otaMetadata || {};
     if (!metadata.bundleId) return res.status(409).type('text').send('The signed app is missing its Bundle ID.');
     const remainingSeconds = Math.floor((Number(manifest.resultExpiresAt || (Number(manifest.completedAt || Date.now()) + SIGNED_IPA_RETENTION_MS)) - Date.now()) / 1000);
     if (remainingSeconds < 1) return res.status(404).type('text').send('Signed IPA expired and was deleted');
-    let ipaUrl;
-    if (manifest.resultPath) {
-      const localPath = safeLocalResultPath(manifest);
-      if (!localPath || !fs.existsSync(localPath)) return res.status(404).type('text').send('Signed IPA unavailable');
-      const origin = (PUBLIC_ORIGIN || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '');
-      ipaUrl = `${origin}/ota/${id}/${token}/signed.ipa`;
-    } else {
-      ipaUrl = await getSignedUrl(getS3(), new GetObjectCommand({Bucket: BUCKET, Key: manifest.resultKey, ResponseContentType: 'application/octet-stream'}), {expiresIn: Math.max(1, Math.min(600, remainingSeconds))});
-    }
+    const ipaUrl = await getSignedUrl(getS3(), new GetObjectCommand({Bucket: BUCKET, Key: manifest.resultKey, ResponseContentType: 'application/octet-stream'}), {expiresIn: Math.max(1, Math.min(600, remainingSeconds))});
     const escapeXml = value => String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;').replace(/'/g, '&apos;');
     const title = escapeXml(metadata.appName || 'Signed app');
     const bundleId = escapeXml(metadata.bundleId);
@@ -1606,7 +1441,7 @@ async function runSigningJob(id) {
     await fsp.mkdir(workDir, {recursive: true});
     const local = {};
     const uploadEntries = Object.entries(manifest.uploads || {}).sort((a, b) => Number(Boolean(b[1].sourceUrl)) - Number(Boolean(a[1].sourceUrl)) || Number(b[1].expectedSize || 0) - Number(a[1].expectedSize || 0));
-    const totalInputBytes = uploadEntries.reduce((sum, [, upload]) => sum + (upload.sourceUrl || upload.localPath ? 0 : Number(upload.expectedSize || 0)), 0);
+    const totalInputBytes = uploadEntries.reduce((sum, [, upload]) => sum + (upload.sourceUrl ? 0 : Number(upload.expectedSize || 0)), 0);
     let downloadedInputBytes = 0;
     // Fetch the IPA and smaller signing inputs concurrently. Tigris downloads use ranged
     // parallel reads for large objects; remote third-party IPA URLs remain safely streamed.
@@ -1614,16 +1449,7 @@ async function runSigningJob(id) {
       const batch = uploadEntries.slice(offset, offset + TIGRIS_OBJECT_TRANSFER_CONCURRENCY);
       const outcomes = await Promise.allSettled(batch.map(async ([kind, upload]) => {
         local[kind] = path.join(workDir, `input-${kind}${path.extname(upload.filename).toLowerCase()}`);
-        if (upload.localPath) {
-          const retainedPath = safeLocalInputPath(upload.localPath);
-          if (!retainedPath) throw new Error(`The retained Render-local ${kind} path is invalid.`);
-          const retainedStat = await fsp.stat(retainedPath).catch(() => null);
-          if (!retainedStat?.isFile()) throw new Error(`The retained Render-local ${kind} file is no longer available. Re-submit the signing job.`);
-          local[kind] = retainedPath;
-          upload.storage = 'render-local';
-          upload.expectedSize = Number(upload.expectedSize || retainedStat.size);
-          appendJobLog(manifest, `Using ${kind} from Render-local scratch storage (${formatBytesSafe(retainedStat.size)}); no Tigris transfer is needed.`, 'system');
-        } else if (upload.sourceUrl) {
+        if (upload.sourceUrl) {
           appendJobLog(manifest, `Downloading ${kind} from the supplied HTTPS URL (${upload.filename}) into temporary signing workspace.`, 'system');
           let lastLoggedPercent = -10;
           const remoteIndex = Object.keys(manifest.uploads).indexOf(kind);
@@ -1640,23 +1466,7 @@ async function runSigningJob(id) {
           });
           upload.expectedSize = downloadedSize;
           upload.actualSize = downloadedSize;
-          if (kind === 'ipa' && downloadedSize > LOCAL_IPA_THRESHOLD_BYTES) {
-            appendJobLog(manifest, `Downloaded IPA exceeds the ${formatBytesSafe(LOCAL_IPA_THRESHOLD_BYTES)} Render-local threshold. Staging source in Tigris for retry-safe large-file handling.`, 'system');
-            const transferStartedAt = Date.now();
-            const staged = await uploadLocalFileToTigris({id, kind: 'ipa', filePath: local.ipa, filename: upload.filename, contentType: 'application/octet-stream'});
-            upload.key = staged.key;
-            upload.contentType = staged.contentType;
-            upload.storage = 'tigris';
-            upload.remote = false;
-            upload.sourceUrl = null;
-            const elapsedMs = Math.max(1, Date.now() - transferStartedAt);
-            appendJobLog(manifest, `Large URL IPA staged in Tigris in ${(elapsedMs / 1000).toFixed(1)}s (${(staged.size / (1024 * 1024) / (elapsedMs / 1000)).toFixed(1)} MiB/s). The current signing attempt will reuse its verified local copy.`, 'system');
-            await flushManifest(manifest);
-          } else if (kind === 'ipa') {
-            upload.storage = 'render-local';
-            appendJobLog(manifest, `Downloaded IPA is ${formatBytesSafe(downloadedSize)}; it stays in the Render-local workspace and does not use Tigris input storage.`, 'system');
-          }
-        } else { 
+        } else {
           appendJobLog(manifest, `Downloading ${kind} (${upload.expectedSize} bytes) from private Tigris storage.`, 'system');
           const transferStartedAt = Date.now();
           let lastMilestone = -10;
@@ -1769,58 +1579,37 @@ async function runSigningJob(id) {
       throw new Error(removeSecretValue(detail, password));
     }
     manifest.phase = 'uploading_result'; manifest.progress = Math.max(91, Number(manifest.progress || 0));
-    if (outputStat.size > MAX_IPA_BYTES) throw new Error(`The signed IPA is ${formatBytesSafe(outputStat.size)}, exceeding the configured ${formatBytesSafe(MAX_IPA_BYTES)} result limit.`);
-    manifest.resultSize = outputStat.size;
-    const keepSignedResultLocal = !SHARED_QUEUE_ENABLED && outputStat.size <= LOCAL_IPA_THRESHOLD_BYTES;
-    if (keepSignedResultLocal) {
-      await fsp.mkdir(LOCAL_RESULT_ROOT, {recursive: true, mode: 0o700});
-      const localResultPath = path.join(LOCAL_RESULT_ROOT, `${id}.ipa`);
-      const temporaryResultPath = `${localResultPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-      try {
-        await fsp.copyFile(output, temporaryResultPath, fs.constants.COPYFILE_EXCL);
-        await fsp.rename(temporaryResultPath, localResultPath);
-      } catch (error) {
-        await fsp.rm(temporaryResultPath, {force: true}).catch(() => {});
-        throw error;
-      }
-      await fsp.rm(output, {force: true});
-      manifest.resultKey = null;
-      manifest.resultPath = localResultPath;
-      appendJobLog(manifest, `Signed IPA is ${formatBytesSafe(outputStat.size)} and uses Render-local result storage; no Tigris result upload is needed.`, 'system');
-      await flushManifest(manifest);
-    } else {
-      manifest.resultKey = `signed/${id}/signed.ipa`;
-      manifest.resultPath = null;
-      appendJobLog(manifest, `zsign exited successfully. Signed IPA size: ${formatBytesSafe(outputStat.size)}. Uploading result to private Tigris storage.`, 'system');
-      await flushManifest(manifest);
-      const uploader = new Upload({
-        client: getS3(),
-        params: {
-          Bucket: BUCKET, Key: manifest.resultKey,
-          Body: fs.createReadStream(output), ContentLength: outputStat.size,
-          ContentType: 'application/octet-stream',
-          ContentDisposition: 'attachment; filename="signed.ipa"',
-          Metadata: {jobid: id, purpose: 'signed-ipa'}
-        },
-        queueSize: TIGRIS_UPLOAD_QUEUE_SIZE, partSize: PART_SIZE, leavePartsOnError: false
-      });
-      let lastResultUploadMark = -5;
-      uploader.on('httpUploadProgress', event => {
-        const loaded = Number(event.loaded || 0);
-        const total = Number(event.total || outputStat.size);
-        if (total > 0) {
-          manifest.progress = Math.max(Number(manifest.progress || 0), Math.min(99, 91 + Math.floor(8 * loaded / total)));
-          const pct = Math.min(100, Math.floor(100 * loaded / total));
-          if (pct >= lastResultUploadMark + 5 || pct === 100) {
-            lastResultUploadMark = Math.floor(pct / 5) * 5;
-            appendJobLog(manifest, `Tigris result upload: ${pct}% (${formatBytesSafe(loaded)} / ${formatBytesSafe(total)}).`, 'system');
-          }
+    manifest.resultKey = `signed/${id}/signed.ipa`;
+    appendJobLog(manifest, `zsign exited successfully. Signed IPA size: ${outputStat.size} bytes. Uploading result to private storage.`, 'system');
+    await flushManifest(manifest);
+    const uploader = new Upload({
+      client: getS3(),
+      params: {
+        Bucket: BUCKET, Key: manifest.resultKey,
+        Body: fs.createReadStream(output), ContentLength: outputStat.size,
+        ContentType: 'application/octet-stream',
+        ContentDisposition: 'attachment; filename="signed.ipa"',
+        Metadata: {jobid: id, purpose: 'signed-ipa'}
+      },
+      queueSize: TIGRIS_UPLOAD_QUEUE_SIZE, partSize: PART_SIZE, leavePartsOnError: false
+    });
+    let lastResultUploadMark = -5;
+    uploader.on('httpUploadProgress', event => {
+      const loaded = Number(event.loaded || 0);
+      const total = Number(event.total || outputStat.size);
+      if (total > 0) {
+        manifest.progress = Math.max(Number(manifest.progress || 0), Math.min(99, 91 + Math.floor(8 * loaded / total)));
+        const pct = Math.min(100, Math.floor(100 * loaded / total));
+        if (pct >= lastResultUploadMark + 5 || pct === 100) {
+          lastResultUploadMark = Math.floor(pct / 5) * 5;
+          appendJobLog(manifest, `Tigris result upload: ${pct}% (${formatBytesSafe(loaded)} / ${formatBytesSafe(total)}).`, 'system');
         }
-        scheduleManifestFlush(manifest);
-      });
-      await uploader.done();
-      await flushManifest(manifest);
-    }
+      }
+      scheduleManifestFlush(manifest);
+    });
+    await uploader.done();
+    await flushManifest(manifest);
+    manifest.resultSize = outputStat.size;
     manifest.completedAt = Date.now();
     manifest.resultExpiresAt = manifest.completedAt + SIGNED_IPA_RETENTION_MS;
     console.log(JSON.stringify({
@@ -1836,7 +1625,7 @@ async function runSigningJob(id) {
     manifest.passwordCipher = null;
     manifest.status = 'completed'; manifest.phase = 'completed'; manifest.progress = 100;
     manifest.error = null;
-    appendJobLog(manifest, manifest.resultPath ? 'Signed IPA saved in Render-local storage. Temporary source files and certificate material will now be removed.' : 'Signed IPA uploaded to Tigris. Temporary source files and certificate material will now be removed.', 'system');
+    appendJobLog(manifest, 'Result uploaded. Temporary source files and certificate material will now be removed.', 'system');
     password = '';
     await flushManifest(manifest);
     if (SHARED_QUEUE_ENABLED && signingQueue) {
@@ -1868,9 +1657,6 @@ async function runSigningJob(id) {
       manifest.passwordCipher = null;
       await cleanupInputs(manifest, true).catch(() => {});
       if (manifest.resultKey) await removeObject(manifest.resultKey);
-      const failedLocalResultPath = safeLocalResultPath(manifest);
-      if (failedLocalResultPath) await fsp.rm(failedLocalResultPath, {force: true}).catch(() => {});
-      manifest.resultPath = null;
       await flushManifest(manifest).catch(() => {});
     }
   } finally {
@@ -1913,7 +1699,7 @@ async function cleanupExpiredSignedResults() {
       const id = key.split('/')[1];
       if (!validateId(id)) continue;
       const manifest = await maybeManifest(id);
-      if (!manifest || manifest.status !== 'completed' || (!manifest.resultKey && !manifest.resultPath)) continue;
+      if (!manifest || manifest.status !== 'completed' || !manifest.resultKey) continue;
       await expireSignedResultIfNeeded(manifest);
     }
   } catch (error) {
@@ -1934,8 +1720,6 @@ async function cleanupExpiredJobs() {
       if (age > ttl) {
         await cleanupInputs(manifest, true).catch(() => {});
         if (manifest.resultKey) await removeObject(manifest.resultKey);
-        const expiredLocalResultPath = safeLocalResultPath(manifest);
-        if (expiredLocalResultPath) await fsp.rm(expiredLocalResultPath, {force: true}).catch(() => {});
         if (!isLocalManifestStorage()) await removeObject(key);
         await fsp.rm(localManifestPath(id), {force: true}).catch(() => {});
         manifestCache.delete(id);

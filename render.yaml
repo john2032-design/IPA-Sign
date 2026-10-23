@@ -23,12 +23,6 @@ services:
         value: "1"
       - key: MAX_IPA_BYTES
         value: "4294967296"
-      - key: LOCAL_IPA_THRESHOLD_BYTES
-        value: "536870912"
-      - key: LOCAL_IPA_DIR
-        value: /tmp/xsigner-local-ipa
-      - key: LOCAL_RESULT_DIR
-        value: /tmp/xsigner-local-results
       - key: MAX_CONCURRENT_JOBS
         value: "1"
       - key: API_SIGN_RATE_LIMIT
